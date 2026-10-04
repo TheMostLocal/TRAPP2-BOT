@@ -54,6 +54,13 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+# Repo owner — resolved at runtime so the pipeline follows the repos to any
+# GitHub account. Actions sets GITHUB_REPOSITORY_OWNER automatically;
+# VALUATIO_OWNER (repo variable/env) overrides; legacy owner is the fallback.
+_GH_OWNER = (__import__("os").environ.get("VALUATIO_OWNER")
+             or __import__("os").environ.get("GITHUB_REPOSITORY_OWNER")
+             or "GoodGlobeLLC").strip()
+
 ROOT = Path(__file__).resolve().parent.parent
 # Canonical state lives in data/. The runner previously read the ROOT copy, which
 # was stale (bankroll reset to $100k, only a couple of trades) — so it ignored the
@@ -61,7 +68,7 @@ ROOT = Path(__file__).resolve().parent.parent
 STATE_FILE = ROOT / "data" / "bot_training_data.json"
 _LEGACY_STATE = ROOT / "bot_training_data.json"
 
-RAW = "https://raw.githubusercontent.com/GoodGlobeLLC"
+RAW = f"https://raw.githubusercontent.com/{_GH_OWNER}"
 UNIVERSE_SOURCES = [
     f"{RAW}/TRAPP2/main/data/master.json",
     f"{RAW}/TRAPP2-2/main/data/master.json",
