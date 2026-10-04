@@ -56,10 +56,10 @@ from pathlib import Path
 
 # Repo owner — resolved at runtime so the pipeline follows the repos to any
 # GitHub account. Actions sets GITHUB_REPOSITORY_OWNER automatically;
-# VALUATIO_OWNER (repo variable/env) overrides; legacy owner is the fallback.
+# VALUATIO_OWNER (repo variable/env) overrides; TheMostLocal is the fallback.
 _GH_OWNER = (__import__("os").environ.get("VALUATIO_OWNER")
              or __import__("os").environ.get("GITHUB_REPOSITORY_OWNER")
-             or "GoodGlobeLLC").strip()
+             or "TheMostLocal").strip()
 
 ROOT = Path(__file__).resolve().parent.parent
 # Canonical state lives in data/. The runner previously read the ROOT copy, which
@@ -1249,6 +1249,11 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
     scanned = 0
     for tk, u in universe.items():
         if tk in held:
+            continue
+        # Index levels (^VIX, ^MOVE, ^GSPC ...) are reference series, not
+        # instruments - they can't be bought, so they never become positions.
+        # They still feed regime / cross-asset signals elsewhere.
+        if tk.startswith("^"):
             continue
         sc = score_symbol(tk, u, ctx)
         scanned += 1
