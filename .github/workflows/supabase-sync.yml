@@ -19,4 +19,5 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          SYNC_TRIGGER: ${{ github.event_name }}   # schedule runs skip stale repo files
         run: python3 pipeline/sync_bot_to_supabase.py
