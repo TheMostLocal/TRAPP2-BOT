@@ -1,5 +1,5 @@
 # ============================================================
-#  >>> DESTINATION: GoodGlobeLLC/TRAPP2-BOT
+#  >>> DESTINATION: TheMostLocal/TRAPP2-BOT
 #  >>> FILE PATH:   .github/workflows/bot-runner.yml
 #
 #  Runs the autonomous bot after the US close with NO app open. It scores the
@@ -141,6 +141,9 @@ jobs:
 
       - name: Mirror trades to Supabase
         if: ${{ github.event.inputs.dry_run != 'true' }}
+        # The sync now exits 1 on a rejected write (::error:: annotation stays on
+        # the run) - but that must never skip marking the book below.
+        continue-on-error: true
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
