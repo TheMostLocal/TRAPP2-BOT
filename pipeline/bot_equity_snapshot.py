@@ -30,6 +30,13 @@ import urllib.error
 import re
 from datetime import datetime, timezone, timedelta
 
+# Repo owner — resolved at runtime so the pipeline follows the repos to any
+# GitHub account. Actions sets GITHUB_REPOSITORY_OWNER automatically;
+# VALUATIO_OWNER (repo variable/env) overrides; legacy owner is the fallback.
+_GH_OWNER = (__import__("os").environ.get("VALUATIO_OWNER")
+             or __import__("os").environ.get("GITHUB_REPOSITORY_OWNER")
+             or "GoodGlobeLLC").strip()
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATE = os.path.join(ROOT, "data", "bot_training_data.json")
 HIST = os.path.join(ROOT, "data", "bot_equity_history.json")
@@ -37,10 +44,11 @@ STARTING_DEFAULT = 100000.0
 MAX_POINTS = 3000            # ~40 market days of 30-min points
 BUCKET_MIN = 30             # snap timestamps to a 30-minute grid
 
-RAW = "https://raw.githubusercontent.com/GoodGlobeLLC"
+RAW = f"https://raw.githubusercontent.com/{_GH_OWNER}"
 MASTER = [f"{RAW}/TRAPP2/main/data/master.json",
           f"{RAW}/TRAPP2-2/main/data/master.json",
-          f"{RAW}/TRAPP2-1/main/data/master.json"]
+          f"{RAW}/TRAPP2-1/main/data/master.json",
+          f"{RAW}/TRAPP2-3/main/data/master.json"]  # gap-fill only (first-wins)
 
 URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 KEY = (os.environ.get("SUPABASE_SERVICE_ROLE") or os.environ.get("SUPABASE_SERVICE_KEY")
