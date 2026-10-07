@@ -54,6 +54,9 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import alt_research  # noqa: E402  research-driven gate for crypto & futures
+
 # Repo owner — resolved at runtime so the pipeline follows the repos to any
 # GitHub account. Actions sets GITHUB_REPOSITORY_OWNER automatically;
 # VALUATIO_OWNER (repo variable/env) overrides; TheMostLocal is the fallback.
@@ -307,6 +310,7 @@ def load_universe():
             rows[t] = {
                 "ticker": t, "price": round(price * f, 6),
                 "priceLocal": price, "currency": ccy, "fxRate": f, "scan": scan,
+                "assetClass": r.get("asset_class"),
                 "sector": r.get("sector") or "Unknown",
                 "name": r.get("name") or t,
                 "repo": repo,
@@ -1207,16 +1211,21 @@ def manage_open_positions(state, universe, today, ctx=None):
         # Re-score + RE-CLASSIFY this holding (the bot reassesses what it owns).
         signed_now = None
         htype = pos.get("horizonType") or "swing"
+        is_alt = alt_research.asset_class(pos.get("ticker"), u) is not None
         if ctx is not None:
             sc = score_symbol(pos["ticker"], u, ctx)
             if sc:
                 signed_now = sc["signed"]
                 conf_now = compute_confidence(sc["comps"], signed_now)
-                htype, lean_now = classify_horizon(sc["comps"], conf_now)
+                htype_now, lean_now = classify_horizon(sc["comps"], conf_now)
                 pos["scoreNow"] = round(signed_now, 3)
                 pos["confidence"] = conf_now
-                pos["horizonType"] = htype
                 pos["longTermLean"] = lean_now
+                # Crypto / futures are tactical, research-driven trades: they keep
+                # their swing stop/target and are never re-classified to CORE.
+                if not is_alt:
+                    htype = htype_now
+                    pos["horizonType"] = htype
 
         aligned_now = (signed_now * direction) if signed_now is not None else None
         exit_reason = None
@@ -1256,6 +1265,9 @@ def manage_open_positions(state, universe, today, ctx=None):
                 exit_reason = "target"
             elif aligned_now is not None and aligned_now <= -CORE_EXIT_SCORE:
                 exit_reason = "thesis-break"
+            elif is_alt and ctx is not None and ctx.get("research") is not None and \
+                    _alt_research_against(pos, u, ctx, today):
+                exit_reason = "research-break"
             else:
                 # Horizon exit ONLY when the reason to hold (the signal) has faded.
                 ed = pos.get("entryDate")
@@ -1291,8 +1303,29 @@ def manage_open_positions(state, universe, today, ctx=None):
     return closed_now
 
 
+def _alt_research_against(pos, u, ctx, today):
+    """Held crypto / futures position: has its research case turned decisively
+    against it? (fundamentals don't exist for these - research is the thesis)."""
+    try:
+        flip, ev = alt_research.research_flip(pos, u, ctx.get("quad"), ctx["research"], today)
+    except Exception as e:
+        log(f"  research check failed for {pos.get('ticker')}: {e}")
+        return False
+    if flip is None:
+        return False
+    pos["researchNow"] = {"date": today, "aligned": round(flip, 3),
+                          "components": (ev or {}).get("components")}
+    return flip <= alt_research.EXIT_FLIP
+
+
+def _alt_class_group(pos):
+    cls, prof = alt_research.profile_for(pos.get("ticker"), {"assetClass": pos.get("assetClass")})
+    return cls, (prof or {}).get("group")
+
+
 # ----------------------------- open new trades --------------------------------
-def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad, opt_market=None, fed=None):
+def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad, opt_market=None, fed=None,
+                    research=None):
     bankroll = state.get("bankroll", STARTING_BANKROLL)
     held = {(p.get("ticker") or "").upper() for p in trades_list(state) if p.get("status") == "open"}
     n_open = len(held)
@@ -1306,7 +1339,10 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
     min_score = max(MIN_SCORE, regime.get("longBar", 0.0) + MIN_SCORE * 0.0)
     ctx = {"weights": weights, "weight_mods": weight_mods, "mode": mode,
            "peer_ranks": peer_ranks, "xa": xa, "quad": quad,
-           "opt_market": opt_market, "fed": fed, "grades": grades}
+           "opt_market": opt_market, "fed": fed, "grades": grades, "research": research}
+    alt_seen = {"crypto": 0, "future": 0}
+    alt_rejects = {}
+    alt_detail = []
 
     committed = sum((p.get("notional") or 0) for p in trades_list(state) if p.get("status") == "open")
     cash = bankroll - committed
@@ -1335,6 +1371,34 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         comps, signed = sc["comps"], sc["signed"]
         conf = compute_confidence(comps, signed)
         trigs = compute_triggers(comps, signed, TRIGGER_LEVEL)
+        # Crypto & futures: no filings, earnings or research grade - price alone
+        # isn't a thesis. They must clear the research gate (drivers, supply
+        # chain, news, regime, seasonality) at a stricter bar.
+        cls = alt_research.asset_class(tk, u)
+        if cls:
+            alt_seen[cls] += 1
+            ev = (alt_research.evaluate(tk, u, signed, quad, research, today, min_score, ALLOW_SHORTS)
+                  if research is not None else None)
+            if not ev or not ev.get("eligible") or not trigs:
+                if ev is None:
+                    why = "no research data"
+                elif not ev.get("eligible"):
+                    why = (ev.get("reasons") or ["not eligible"])[0]
+                else:
+                    why = "no technical trigger"
+                key = ("below the research/tech bar" if "below the alt bar" in why else
+                       "thin evidence" if ("component" in why or "no driver" in why or "no research" in why) else
+                       "vetoed" if why.startswith("vetoed") else why[:40])
+                alt_rejects[key] = alt_rejects.get(key, 0) + 1
+                if ev:
+                    alt_detail.append((signed, tk, ev))
+                continue
+            candidates.append({"ticker": tk, "score": ev["rankScore"], "direction": ev["direction"],
+                               "components": comps, "confidence": conf, "triggers": trigs,
+                               "price": u["price"], "sector": u["sector"], "name": u["name"],
+                               "priceLocal": u.get("priceLocal"), "currency": u.get("currency"),
+                               "fxRate": u.get("fxRate"), "alt": ev})
+            continue
         # Only take a trade that actually has concrete triggers firing for it.
         if signed >= min_score and len(trigs) >= MIN_TRIGGERS:
             candidates.append({"ticker": tk, "score": signed, "direction": "long",
@@ -1351,17 +1415,59 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
     n_short = sum(1 for c in candidates if c["direction"] == "short")
     log(f"  regime={mode} quad={quad} · scanned {scanned} · {n_long} long"
         f"{f' / {n_short} short' if ALLOW_SHORTS else ''} pass (min {min_score:.2f})")
+    n_alt_pass = sum(1 for c in candidates if c.get("alt"))
+    if sum(alt_seen.values()):
+        log(f"  alt research: {alt_seen['crypto']} crypto + {alt_seen['future']} futures scanned · "
+            f"{n_alt_pass} passed the research gate"
+            + (" · rejected: " + ", ".join(f"{k} {v}" for k, v in sorted(alt_rejects.items(), key=lambda x: -x[1]))
+               if alt_rejects else ""))
+        # The strongest technical setups that research held back - so the log
+        # explains WHY a hot chart wasn't bought.
+        for sgn, tk, ev in sorted(alt_detail, key=lambda x: -x[0])[:5]:
+            comp = ", ".join(f"{k} {v:+.2f}" for k, v in (ev.get("components") or {}).items())
+            r = ev.get("research")
+            log(f"    {tk:8s} tech {sgn:+.2f} · research {r:+.2f} [{comp}] · news {ev.get('newsCoverage', 0)}"
+                if r is not None else f"    {tk:8s} tech {sgn:+.2f} · {', '.join(ev.get('reasons') or [])}")
+
+    # Concurrency caps for crypto / futures (per class, and per futures complex).
+    open_alt = {"crypto": 0, "future": 0}
+    open_groups = {}
+    for p in trades_list(state):
+        if p.get("status") != "open":
+            continue
+        cls_p, grp_p = _alt_class_group(p)
+        if cls_p:
+            open_alt[cls_p] += 1
+            if cls_p == "future" and grp_p:
+                open_groups[grp_p] = open_groups.get(grp_p, 0) + 1
 
     opened = []
     slots = min(MAX_NEW_TRADES, MAX_POSITIONS - n_open)
-    for c in candidates[:slots]:
+    for c in candidates:
+        if len(opened) >= slots:
+            break
+        alt = c.get("alt")
+        if alt:
+            cls_c, grp_c = alt["assetClass"], alt.get("group")
+            if open_alt.get(cls_c, 0) >= alt_research.MAX_OPEN[cls_c]:
+                log(f"  skip {c['ticker']}: {cls_c} cap ({alt_research.MAX_OPEN[cls_c]}) reached")
+                continue
+            if cls_c == "future" and open_groups.get(grp_c, 0) >= alt_research.MAX_PER_GROUP:
+                log(f"  skip {c['ticker']}: already hold a {grp_c} future")
+                continue
         conf = c.get("confidence", 0.0)
         htype, lean = classify_horizon(c["components"], conf)
+        if alt:
+            htype = "swing"            # research-driven alt trades are tactical
         is_short = c.get("direction") == "short"
         # Confidence-scaled sizing: 0.6x (low) → 1.4x (high), hard-capped at 1.6x base.
         size = min(bankroll * POSITION_PCT * (0.6 + 0.8 * conf),
                    deployable, bankroll * POSITION_PCT * 1.6)
+        if alt:
+            size *= alt["sizeMult"]    # smaller + volatility-scaled for crypto / futures
         if size < bankroll * 0.01:
+            if alt:
+                continue
             break
         shares = round(size / c["price"], 4)
         if shares <= 0:
@@ -1373,6 +1479,12 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             target = None                                   # ride it; managed by trim + thesis-break
             horizon_days = None                             # no fixed-calendar exit
             style = "core"
+        elif alt:
+            sp, tp = alt["stopPct"], alt["targetPct"]          # volatility-based
+            stop = round(c["price"] * ((1 + sp) if is_short else (1 - sp)), 6)
+            target = round(c["price"] * ((1 - tp) if is_short else (1 + tp)), 6)
+            horizon_days = SWING_HORIZON
+            style = "research"
         else:
             stop = round(c["price"] * ((1 + SWING_STOP) if is_short else (1 - SWING_STOP)), 4)
             target = round(c["price"] * ((1 - SWING_TARGET) if is_short else (1 + SWING_TARGET)), 4)
@@ -1405,6 +1517,25 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             "cashAfter": round(cash - notional, 2),
             "placedBy": "runner",
         }
+        if alt:
+            det = alt.get("detail") or {}
+            trade["assetClass"] = alt["assetClass"]
+            trade["altGroup"] = alt.get("group")
+            trade["research"] = {
+                "composite": alt.get("research"), "components": alt.get("components"),
+                "newsCoverage": alt.get("newsCoverage"), "stopPct": alt["stopPct"],
+                "targetPct": alt["targetPct"], "sizeMult": alt["sizeMult"], "dailyVol": alt.get("dailyVol"),
+                "drivers": det.get("drivers"), "supplyChain": det.get("supplyChain"),
+                "news": det.get("news"), "seasonality": det.get("seasonality"), "regime": det.get("regime"),
+            }
+            comp_txt = ", ".join(f"{k} {v:+.2f}" for k, v in (alt.get("components") or {}).items())
+            trade["rationale"].append(
+                f"RESEARCH {alt['assetClass']}/{alt.get('group')} · composite {alt.get('research'):+.2f} "
+                f"({comp_txt}) · {alt.get('newsCoverage', 0)} headline(s) · stop {alt['stopPct']*100:.1f}% / "
+                f"target {alt['targetPct']*100:.1f}% · size x{alt['sizeMult']:.2f}")
+            open_alt[alt["assetClass"]] = open_alt.get(alt["assetClass"], 0) + 1
+            if alt["assetClass"] == "future" and alt.get("group"):
+                open_groups[alt["group"]] = open_groups.get(alt["group"], 0) + 1
         # cash decrements on buy so the book stays consistent
         committed += notional
         cash -= notional
@@ -1521,8 +1652,12 @@ def main():
     ctx = {"weights": weights, "weight_mods": regime.get("weightMods", {}),
            "mode": regime.get("mode", "choppy"), "peer_ranks": peer_ranks,
            "xa": xa, "quad": quad, "opt_market": opt_market, "fed": fed, "grades": grades}
+    # Research layer for crypto / futures (drivers, supply chain, news, regime,
+    # seasonality) - shared cache for management + new entries.
+    ctx["research"] = alt_research.ResearchData(fetch_json, RAW, universe, today)
     closed = manage_open_positions(state, universe, today, ctx)
-    opened = open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad, opt_market, fed)
+    opened = open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad, opt_market, fed,
+                             research=ctx["research"])
     recompute(state, universe, today)
 
     log(f"summary: +{len(opened)} opened · {len(closed)} closed · "
