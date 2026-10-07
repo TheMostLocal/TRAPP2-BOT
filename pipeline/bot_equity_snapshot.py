@@ -185,26 +185,33 @@ def load_fx():
     return out
 
 
+# Quote sub-units -> (base currency, factor). Same table as bot_runner.py and
+# sync_port_to_supabase.py. Case matters: Yahoo reports London pence as "GBp";
+# upper-casing it to "GBP" valued pence as pounds (100x) and the sanity guard
+# then dropped those lots from the book. Cent-quoted futures (USX) had no rate
+# at all, so they were never valued.
+_SUBUNIT = {"USX": ("USD", 0.01), "USd": ("USD", 0.01),
+            "GBp": ("GBP", 0.01), "GBX": ("GBP", 0.01),
+            "ZAc": ("ZAR", 0.01), "ZAC": ("ZAR", 0.01),
+            "ILA": ("ILS", 0.01), "ILa": ("ILS", 0.01)}
+
+
 def make_price_of(base, live, fx):
-    """USD price for a ticker: live quote (or master) in its local currency,
-    converted with fx. GBX/GBp (London pence) handled. Returns None if the
-    currency has no loaded rate (so it's excluded rather than mis-valued)."""
+    """USD price for a ticker: live quote (or master) in its local units,
+    converted with fx (sub-units handled). None if the currency has no loaded
+    rate, so it's excluded rather than mis-valued."""
+    fx = dict(fx or {})
+    fx.setdefault("USD", 1.0)
+
     def price_of(tic):
         e = base.get(tic)
-        ccy = ((e["currency"] if e else "USD") or "USD").upper()
+        raw = ((e["currency"] if e else "USD") or "USD").strip() or "USD"
         local = live.get(tic) if tic in live else (e["price"] if e else None)
         if local is None:
             return None
-        pence = 1.0
-        if ccy in ("GBX", "GBP", "GBP.", "ZAC", "ILA"):
-            if ccy in ("GBX",):
-                ccy, pence = "GBP", 0.01
-        if ccy in ("GBP",) and False:
-            pass
-        if ccy == "USD":
-            return local
+        ccy, sub = _SUBUNIT.get(raw, (raw.upper(), 1.0))
         r = fx.get(ccy)
-        return (local * pence * r) if r else None
+        return (local * sub * r) if r else None
     return price_of
 
 
