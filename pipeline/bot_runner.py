@@ -69,14 +69,24 @@ STATE_FILE = ROOT / "data" / "bot_training_data.json"
 _LEGACY_STATE = ROOT / "bot_training_data.json"
 
 RAW = f"https://raw.githubusercontent.com/{_GH_OWNER}"
+# Repos the bot SCANS for new ideas (strategy unchanged) ...
 UNIVERSE_SOURCES = [
     f"{RAW}/TRAPP2/main/data/master.json",
     f"{RAW}/TRAPP2-2/main/data/master.json",
 ]
+# ... and repos it only PRICES, so a position opened from any book (the app's
+# bot trades foreign listings too, e.g. 000660.KS) is marked and managed.
+PRICE_ONLY_SOURCES = [
+    f"{RAW}/TRAPP2-1/main/data/master.json",
+    f"{RAW}/TRAPP2-3/main/data/master.json",
+]
 HISTORY_BASE = {
     "TRAPP2": f"{RAW}/TRAPP2/main/data/history",
     "TRAPP2-2": f"{RAW}/TRAPP2-2/main/data/history",
+    "TRAPP2-1": f"{RAW}/TRAPP2-1/main/data/history",
+    "TRAPP2-3": f"{RAW}/TRAPP2-3/main/data/history",
 }
+FX_URL = f"{RAW}/TRAPP2-1/main/data/fx/rates.json"
 GRADES_URL = f"{RAW}/TRAPP2-ANALYTICS/main/data/research_grades.json"
 # Sector ETFs live in TRAPP2-1's history; used for sector-momentum + regime.
 ETF_HISTORY_BASE = f"{RAW}/TRAPP2-1/main/data/history"
@@ -230,29 +240,73 @@ def trades_list(state):
 
 
 # ----------------------------- market data ------------------------------------
+# ----------------------------- USD basis ---------------------------------------
+# Every price the bot trades or marks is in USD - the same basis the app's bot
+# uses (normalizeRowToUSD), so entries, stops, targets, P&L, the equity tape and
+# the app's display all agree. master.json quotes in LOCAL units: foreign
+# listings in their currency, CBOT/ICE softs in US CENTS (USX), London in PENCE.
+# Before z80 the runner used those raw - a corn future opened at "$497" (the app
+# then marked it at $4.97 = -99%), and foreign holdings were never managed.
+_SUBUNIT = {"USX": ("USD", 0.01), "USd": ("USD", 0.01),
+            "GBp": ("GBP", 0.01), "GBX": ("GBP", 0.01),
+            "ZAc": ("ZAR", 0.01), "ZAC": ("ZAR", 0.01),
+            "ILA": ("ILS", 0.01), "ILa": ("ILS", 0.01)}
+
+
+def load_fx():
+    """USD-per-unit map from TRAPP2-1/data/fx/rates.json (the file the app uses)."""
+    d = fetch_json(FX_URL)
+    rates = (d.get("rates") if isinstance(d, dict) else {}) or {}
+    out = {"USD": 1.0}
+    for ccy, v in rates.items():
+        try:
+            up = float(v.get("usdPer")) if isinstance(v, dict) else None
+        except (TypeError, ValueError):
+            up = None
+        if up and up > 0 and math.isfinite(up):
+            out[str(ccy).upper()] = up
+    return out
+
+
+def usd_factor(currency, fx):
+    """Multiplier local-quote -> USD, or None when the currency has no rate."""
+    raw = (currency or "USD").strip() or "USD"
+    base, sub = _SUBUNIT.get(raw, (raw.upper(), 1.0))
+    rate = fx.get(base)
+    return None if rate is None else rate * sub
+
+
 def load_universe():
-    """ticker -> {price, sector, name, grade, repo, ...} from master.json files."""
-    rows = {}
-    for url in UNIVERSE_SOURCES:
+    """ticker -> {price (USD), priceLocal, currency, fxRate, sector, name, repo,
+    scan, ...} from master.json files. `scan` marks the repos the bot may open new
+    trades from; the rest are priced so held positions are always managed."""
+    fx = load_fx()
+    rows, no_rate = {}, {}
+    for url, scan in [(u, True) for u in UNIVERSE_SOURCES] + [(u, False) for u in PRICE_ONLY_SOURCES]:
         data = fetch_json(url)
         if not isinstance(data, list):
             continue
-        repo = "TRAPP2" if "TRAPP2/main" in url else "TRAPP2-2"
+        repo = url.split(f"{RAW}/", 1)[1].split("/", 1)[0]
         for r in data:
             t = (r.get("ticker") or r.get("symbol") or "").upper()
             if not t or t in rows:
                 continue
-            price = r.get("price")
+            price = None
+            for fld in ("price", "close", "closeyest"):   # last close when there's no live quote
+                v = _f(r.get(fld))
+                if v is not None and math.isfinite(v) and v > 0:
+                    price = v
+                    break
             if price is None:
-                price = r.get("close")
-            try:
-                price = float(price)
-            except (TypeError, ValueError):
                 continue
-            if not price or price <= 0:
+            ccy = (r.get("currency") or "USD")
+            f = usd_factor(ccy, fx)
+            if f is None:
+                no_rate[t] = ccy
                 continue
             rows[t] = {
-                "ticker": t, "price": price,
+                "ticker": t, "price": round(price * f, 6),
+                "priceLocal": price, "currency": ccy, "fxRate": f, "scan": scan,
                 "sector": r.get("sector") or "Unknown",
                 "name": r.get("name") or t,
                 "repo": repo,
@@ -281,7 +335,13 @@ def load_universe():
                 "dividend_yield": _f(r.get("dividend_yield")),
                 "payoutRatio": _f(r.get("payoutRatio")),
             }
-    log(f"universe: {len(rows)} priced tickers")
+    n_scan = sum(1 for v in rows.values() if v["scan"])
+    n_conv = sum(1 for v in rows.values() if v["fxRate"] != 1.0)
+    log(f"universe: {len(rows)} priced tickers in USD ({n_scan} scannable, {len(rows) - n_scan} price-only; "
+        f"{n_conv} converted from local units)")
+    if no_rate:
+        log(f"  {len(no_rate)} skipped - no FX rate: "
+            + ", ".join(f"{t}({c})" for t, c in sorted(no_rate.items())[:10]))
     return rows
 
 
@@ -1118,8 +1178,19 @@ def manage_open_positions(state, universe, today, ctx=None):
         u = universe.get((pos.get("ticker") or "").upper())
         if not u:
             continue
-        px = u["price"]
+        px = u["price"]                     # USD
+        entry0 = pos.get("entryPrice")
+        # Guard: an entry recorded in LOCAL units (e.g. cents) against a USD mark
+        # shows as a 100x move. Never stop/target/close on that - flag and skip.
+        if entry0 and (px / entry0 > 10 or px / entry0 < 0.1):
+            pos["markSuspect"] = {"date": today, "markUsd": px, "entry": entry0,
+                                  "currency": u.get("currency")}
+            log(f"  ! {pos.get('ticker')}: mark ${px:,.4f} vs entry {entry0:,.4f} - unit mismatch "
+                f"({u.get('currency')}); position left untouched")
+            continue
+        pos.pop("markSuspect", None)
         pos["lastPrice"] = px
+        pos["lastPriceLocal"] = u.get("priceLocal")
         direction = -1 if pos.get("direction") == "short" else 1
         entry = pos.get("entryPrice") or px
         shares = pos.get("shares") or ((pos.get("notional") or 0) / entry if entry else 0)
@@ -1255,6 +1326,8 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         # They still feed regime / cross-asset signals elsewhere.
         if tk.startswith("^"):
             continue
+        if not u.get("scan", True):
+            continue   # price-only book (TRAPP2-1 / TRAPP2-3): managed when held, never scanned
         sc = score_symbol(tk, u, ctx)
         scanned += 1
         if sc is None:
@@ -1266,11 +1339,13 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         if signed >= min_score and len(trigs) >= MIN_TRIGGERS:
             candidates.append({"ticker": tk, "score": signed, "direction": "long",
                                "components": comps, "confidence": conf, "triggers": trigs,
-                               "price": u["price"], "sector": u["sector"], "name": u["name"]})
+                               "price": u["price"], "sector": u["sector"], "name": u["name"],
+                               "priceLocal": u.get("priceLocal"), "currency": u.get("currency"), "fxRate": u.get("fxRate")})
         elif ALLOW_SHORTS and signed <= SHORT_SCORE and len(trigs) >= MIN_TRIGGERS:
             candidates.append({"ticker": tk, "score": abs(signed), "direction": "short",
                                "components": comps, "confidence": conf, "triggers": trigs,
-                               "price": u["price"], "sector": u["sector"], "name": u["name"]})
+                               "price": u["price"], "sector": u["sector"], "name": u["name"],
+                               "priceLocal": u.get("priceLocal"), "currency": u.get("currency"), "fxRate": u.get("fxRate")})
     candidates.sort(key=lambda c: c["score"], reverse=True)
     n_long = sum(1 for c in candidates if c["direction"] == "long")
     n_short = sum(1 for c in candidates if c["direction"] == "short")
@@ -1311,6 +1386,10 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             "style": style, "horizonType": htype, "horizonDays": horizon_days,
             "entryDate": today, "exitDate": None,
             "entryPrice": c["price"], "exitPrice": None, "peakPrice": c["price"],
+            # USD basis (z80): entryPrice/stop/target/P&L are USD; the local quote
+            # and the conversion used are kept for audit.
+            "priceBasis": "USD", "currency": c.get("currency") or "USD",
+            "entryPriceLocal": c.get("priceLocal"), "fxAtEntry": c.get("fxRate"),
             "shares": shares, "notional": notional, "dollars": notional,
             "allocationPct": round(notional / bankroll * 100, 2), "leverage": 1, "hedge": False,
             "stopPrice": stop, "targetPrice": target, "trimTier": 0, "trims": [],
