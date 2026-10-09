@@ -156,8 +156,28 @@ def _envf(name, default):
     except (TypeError, ValueError):
         return float(default)
 
-MAX_NEW_TRADES = int(_envf("RUNNER_MAX_NEW_TRADES", 2))
-MAX_POSITIONS = int(_envf("RUNNER_MAX_POSITIONS", 25))
+# ---- trading MODE -------------------------------------------------------------
+# explore   (default now): QUANTITY over quality - more, smaller, still-analysed
+#           trades to collect outcome data the bot learns from. Bad trades are
+#           expected and useful; nothing opens without the full signal blend +
+#           a fired trigger (crypto/futures also need their research case).
+# precision (later): the original stricter, fewer/larger-trade settings.
+# Any RUNNER_* repo Variable still overrides the mode's default.
+RUNNER_MODE = (os.environ.get("RUNNER_MODE") or "explore").strip().lower()
+if RUNNER_MODE not in ("explore", "precision"):
+    RUNNER_MODE = "explore"
+_MODE = {
+    "explore":   {"max_new": 6, "max_pos": 40, "pos_pct": 3, "reserve": 15, "min_score": 0.25,
+                  "min_size_pct": 0.5, "pattern_nudge": 0.05, "same_primary": 2},
+    "precision": {"max_new": 2, "max_pos": 25, "pos_pct": 5, "reserve": 20, "min_score": 0.35,
+                  "min_size_pct": 1.0, "pattern_nudge": 0.0, "same_primary": 99},
+}[RUNNER_MODE]
+MAX_NEW_TRADES = int(_envf("RUNNER_MAX_NEW_TRADES", _MODE["max_new"]))
+MAX_POSITIONS = int(_envf("RUNNER_MAX_POSITIONS", _MODE["max_pos"]))
+MIN_POSITION_PCT = _envf("RUNNER_MIN_POSITION_PCT", _MODE["min_size_pct"]) / 100.0
+PATTERN_NUDGE = _envf("RUNNER_PATTERN_NUDGE", _MODE["pattern_nudge"])   # see open_new_trades
+MAX_SAME_PRIMARY = int(_envf("RUNNER_MAX_SAME_PRIMARY", _MODE["same_primary"]))
+FACTOR_CAP = _envf("RUNNER_FACTOR_CAP", 0.25)        # max share of the blend any one signal can carry
 
 # ---- confidence, triggers, and horizon-aware exits -------------------------
 # The runner classifies every position as SWING (momentum, tight exits) or CORE
@@ -181,14 +201,14 @@ CORE_TRIM_FRAC = _envf("RUNNER_CORE_TRIM_FRAC", 25) / 100.0 # trim this fraction
 
 LONG_TERM_SIGNALS = ("fundamentals", "researchGrade", "health", "peerGrade", "regimeGrade", "fed", "crossAsset")
 SWING_SIGNALS     = ("trend", "momentum", "meanReversion", "optionsIV", "optionsMarket")
-POSITION_PCT = _envf("RUNNER_POSITION_PCT", 5) / 100.0
-CASH_RESERVE_PCT = _envf("RUNNER_CASH_RESERVE_PCT", 20) / 100.0
-MIN_SCORE = _envf("RUNNER_MIN_SCORE", 0.35)
+POSITION_PCT = _envf("RUNNER_POSITION_PCT", _MODE["pos_pct"]) / 100.0
+CASH_RESERVE_PCT = _envf("RUNNER_CASH_RESERVE_PCT", _MODE["reserve"]) / 100.0
+MIN_SCORE = _envf("RUNNER_MIN_SCORE", _MODE["min_score"])
 DRY_RUN = os.environ.get("RUNNER_DRY_RUN", "") in ("1", "true", "yes")
 # Optional: allow the runner to SHORT on strongly-negative scores (off by default;
 # the runner is long-only unless you flip this). Options/leverage remain off.
 ALLOW_SHORTS = os.environ.get("RUNNER_ALLOW_SHORTS", "") in ("1", "true", "yes")
-SHORT_SCORE = -_envf("RUNNER_MIN_SCORE", 0.35) - 0.10   # a bit more conviction to short
+SHORT_SCORE = -MIN_SCORE - 0.10   # a bit more conviction to short
 FEE_BPS = 0.0005  # ~5bps/side, matches the app's estimate
 
 
@@ -896,7 +916,31 @@ BASE_WEIGHTS = {
     "trend": 0.18, "momentum": 0.14, "meanReversion": 0.06,
     "crossAsset": 0.10, "peerGrade": 0.12, "regimeGrade": 0.14,
     "optionsIV": 0.07, "optionsMarket": 0.05, "fed": 0.08,
+    # Chart patterns / templates (TRAPP2-ANALYTICS patterns engine): ONE factor
+    # among many - weighted like cross-asset, well below fundamentals or trend,
+    # and further capped by FACTOR_CAP. It can fire a trigger; it can't decide alone.
+    "pattern": 0.10,
 }
+
+
+def _capped(ws, cap):
+    """Limit any single signal to `cap` of the total absolute weight (only when
+    >= 5 signals are present - with fewer, a cap can't be satisfied). Keeps the
+    blend from leaning on one factor. Exact water-filling: capped signals get
+    exactly cap x the final total; the rest keep their weights."""
+    if len(ws) < 5 or cap <= 0 or cap * len(ws) < 1:
+        return ws
+    capped = set()
+    while True:
+        free = sum(abs(w) for k, w in ws.items() if k not in capped)
+        if not free:
+            return ws
+        total = free / (1 - cap * len(capped))
+        over = {k for k, w in ws.items() if k not in capped and abs(w) > cap * total + 1e-12}
+        if not over:
+            break
+        capped |= over
+    return {k: ((1 if w >= 0 else -1) * cap * total if k in capped else w) for k, w in ws.items()}
 
 
 def blend_score(comps, weights, weight_mods):
@@ -907,6 +951,7 @@ def blend_score(comps, weights, weight_mods):
     mod     = the regime tilt (weightMods). Matches app.js add() exactly.
     """
     num, den = 0.0, 0.0
+    ws = {}
     for k, v in comps.items():
         if v is None:
             continue
@@ -917,11 +962,65 @@ def blend_score(comps, weights, weight_mods):
         except (TypeError, ValueError):
             learned = 1.0
         mod = weight_mods.get(k, 1.0)             # regime tilts the signal's influence
-        w = base * learned * mod
-        num += v * w
+        ws[k] = base * learned * mod
+    for k, w in _capped(ws, FACTOR_CAP).items():   # no single factor dominates
+        num += comps[k] * w
         den += abs(w)
     signed = (num / den) if den else 0.0
     return max(-1.0, min(1.0, signed))
+
+
+# ----------------------------- chart-pattern factor ---------------------------
+PATTERN_STATUS_W = {"confirmed": 1.0, "identified": 0.6, "open": 0.6, "timeout": 0.3,
+                    "success": 0.35,       # already hit its target - less left
+                    "invalidated": -0.4,   # a FAILED pattern often runs the other way
+                    "failure": -0.4, "expired": 0.0}
+
+
+def load_patterns():
+    """Recent identifications from the patterns engine + each template's
+    backtest edge. -> {"by": {TICKER: [signal, ...]}, "rel": {template: 0..1}}"""
+    base = f"{RAW}/TRAPP2-ANALYTICS/main/data/patterns"
+    sig = fetch_json(f"{base}/signals.json") or {}
+    st = fetch_json(f"{base}/stats.json") or {}
+    rel = {}
+    for k, t in ((st.get("templates") or {}).items()):
+        edge = ((t or {}).get("backtest") or {}).get("edgeVsBaselinePct")
+        # earned trust: +4pp 20-day edge -> 1.0, no edge -> 0.5, negative -> floor 0.15
+        rel[k] = max(0.15, min(1.0, 0.5 + (edge / 4.0))) if isinstance(edge, (int, float)) else 0.5
+    by = {}
+    for s in (sig.get("signals") or []):
+        t = (s.get("ticker") or "").upper()
+        if t:
+            by.setdefault(t, []).append(s)
+    log(f"patterns: {sum(len(v) for v in by.values())} recent identifications on {len(by)} tickers"
+        f" (scan {sig.get('asOf', '?')}); template trust " +
+        ", ".join(f"{k} {v:.2f}" for k, v in sorted(rel.items(), key=lambda x: -x[1])[:6]))
+    return {"by": by, "rel": rel, "asOf": sig.get("asOf")}
+
+
+def pattern_signal(tk, pats):
+    """-> (value in [-1, 1] or None, detail). Direction x lifecycle weight x the
+    template's earned trust, summed over the ticker's recent calls."""
+    if not pats:
+        return None, None
+    rows = pats["by"].get((tk or "").upper()) or []
+    if not rows:
+        return None, None
+    total, parts = 0.0, []
+    for s in rows:
+        d = 1 if s.get("direction") == "bullish" else -1
+        w = PATTERN_STATUS_W.get(s.get("status"), 0.0)
+        r = pats["rel"].get(s.get("template"), 0.5)
+        v = d * w * r
+        if v:
+            total += v
+            parts.append({"template": s.get("template"), "status": s.get("status"),
+                          "identDate": s.get("identDate"), "trust": round(r, 2), "value": round(v, 3)})
+    if not parts:
+        return None, None
+    parts.sort(key=lambda x: -abs(x["value"]))
+    return max(-1.0, min(1.0, total)), parts
 
 
 # ----------------------------- position management ----------------------------
@@ -1125,6 +1224,9 @@ def score_symbol(tk, u, ctx):
         fs = fed_signal(u.get("sector"), ctx["fed"])
         if fs is not None and abs(fs) > 0.02:
             comps["fed"] = fs
+    pv, _ = pattern_signal(tk, ctx.get("patterns"))
+    if pv is not None:
+        comps["pattern"] = pv
     return {"comps": comps, "signed": blend_score(comps, ctx["weights"], ctx["weight_mods"])}
 
 
@@ -1325,7 +1427,7 @@ def _alt_class_group(pos):
 
 # ----------------------------- open new trades --------------------------------
 def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad, opt_market=None, fed=None,
-                    research=None):
+                    research=None, patterns=None):
     bankroll = state.get("bankroll", STARTING_BANKROLL)
     held = {(p.get("ticker") or "").upper() for p in trades_list(state) if p.get("status") == "open"}
     n_open = len(held)
@@ -1336,10 +1438,15 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
     weights = state.get("learnedWeights", {}) if isinstance(state.get("learnedWeights"), dict) else {}
     weight_mods = regime.get("weightMods", {})
     mode = regime.get("mode", "choppy")
-    min_score = max(MIN_SCORE, regime.get("longBar", 0.0) + MIN_SCORE * 0.0)
+    # The regime still raises the bar in rough markets; explore mode softens it by
+    # 0.10 so data keeps flowing (precision mode keeps the full regime bar).
+    soften = 0.10 if RUNNER_MODE == "explore" else 0.0
+    min_score = max(MIN_SCORE, regime.get("longBar", 0.0) - soften)
     ctx = {"weights": weights, "weight_mods": weight_mods, "mode": mode,
            "peer_ranks": peer_ranks, "xa": xa, "quad": quad,
-           "opt_market": opt_market, "fed": fed, "grades": grades, "research": research}
+           "opt_market": opt_market, "fed": fed, "grades": grades, "research": research,
+           "patterns": patterns}
+    pat_seen = {"aligned": 0, "nudged": 0, "overruled": 0}
     alt_seen = {"crypto": 0, "future": 0}
     alt_rejects = {}
     alt_detail = []
@@ -1400,11 +1507,26 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                                "fxRate": u.get("fxRate"), "alt": ev})
             continue
         # Only take a trade that actually has concrete triggers firing for it.
+        pat = comps.get("pattern")
+        pat_fired = pat is not None and pat >= TRIGGER_LEVEL and any(t["signal"] == "pattern" for t in trigs)
+        if pat is not None and pat > 0:
+            pat_seen["aligned"] += 1
+        entry_reason = None
         if signed >= min_score and len(trigs) >= MIN_TRIGGERS:
+            entry_reason = "blend"
+        elif pat_fired and PATTERN_NUDGE > 0 and signed >= min_score - PATTERN_NUDGE:
+            # A confirmed, trusted chart pattern can tip a NEAR-threshold name over
+            # the line - the rest of the blend still has to be almost there.
+            entry_reason = "pattern-nudge"
+            pat_seen["nudged"] += 1
+        elif pat is not None and pat >= TRIGGER_LEVEL:
+            pat_seen["overruled"] += 1          # TA said yes, the other factors didn't
+        if entry_reason:
             candidates.append({"ticker": tk, "score": signed, "direction": "long",
                                "components": comps, "confidence": conf, "triggers": trigs,
                                "price": u["price"], "sector": u["sector"], "name": u["name"],
-                               "priceLocal": u.get("priceLocal"), "currency": u.get("currency"), "fxRate": u.get("fxRate")})
+                               "priceLocal": u.get("priceLocal"), "currency": u.get("currency"), "fxRate": u.get("fxRate"),
+                               "entryReason": entry_reason})
         elif ALLOW_SHORTS and signed <= SHORT_SCORE and len(trigs) >= MIN_TRIGGERS:
             candidates.append({"ticker": tk, "score": abs(signed), "direction": "short",
                                "components": comps, "confidence": conf, "triggers": trigs,
@@ -1413,8 +1535,11 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
     candidates.sort(key=lambda c: c["score"], reverse=True)
     n_long = sum(1 for c in candidates if c["direction"] == "long")
     n_short = sum(1 for c in candidates if c["direction"] == "short")
-    log(f"  regime={mode} quad={quad} · scanned {scanned} · {n_long} long"
+    log(f"  mode={RUNNER_MODE} regime={mode} quad={quad} · scanned {scanned} · {n_long} long"
         f"{f' / {n_short} short' if ALLOW_SHORTS else ''} pass (min {min_score:.2f})")
+    if patterns:
+        log(f"  pattern factor: {pat_seen['aligned']} names with a bullish pattern read · "
+            f"{pat_seen['nudged']} nudged over the bar · {pat_seen['overruled']} strong patterns overruled by the other factors")
     n_alt_pass = sum(1 for c in candidates if c.get("alt"))
     if sum(alt_seen.values()):
         log(f"  alt research: {alt_seen['crypto']} crypto + {alt_seen['future']} futures scanned · "
@@ -1443,9 +1568,28 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
 
     opened = []
     slots = min(MAX_NEW_TRADES, MAX_POSITIONS - n_open)
+    primary_count = {}
+    # Explore: pattern-led setups rank below full-blend ones by construction, so
+    # without help they'd never be sampled. Reserve the LAST slot for the best
+    # candidate whose triggers include a chart pattern (it still passed the blend
+    # or the near-threshold nudge above) - so TA-triggered trades get tested too.
+    if RUNNER_MODE == "explore" and slots >= 2 and len(candidates) > slots - 1:
+        is_pat = lambda c: any(t.get("signal") == "pattern" for t in (c.get("triggers") or []))
+        if not any(is_pat(c) for c in candidates[:slots]):
+            best = next((c for c in candidates[slots - 1:] if is_pat(c)), None)
+            if best:
+                candidates.remove(best)
+                candidates.insert(slots - 1, best)
+                log(f"  reserved a slot for pattern-led {best['ticker']} (score {best['score']:.2f}, "
+                    f"{best.get('entryReason', 'blend')})")
     for c in candidates:
         if len(opened) >= slots:
             break
+        # Breadth: at most MAX_SAME_PRIMARY new trades per run may share the same
+        # lead trigger - the data set should cover many reasons to trade, not one.
+        primary = (c.get("triggers") or [{}])[0].get("signal") or "blend"
+        if primary_count.get(primary, 0) >= MAX_SAME_PRIMARY:
+            continue
         alt = c.get("alt")
         if alt:
             cls_c, grp_c = alt["assetClass"], alt.get("group")
@@ -1465,7 +1609,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                    deployable, bankroll * POSITION_PCT * 1.6)
         if alt:
             size *= alt["sizeMult"]    # smaller + volatility-scaled for crypto / futures
-        if size < bankroll * 0.01:
+        if size < bankroll * MIN_POSITION_PCT:
             if alt:
                 continue
             break
@@ -1516,7 +1660,13 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                           (", ".join(f"{t['signal']} {t['value']:+.2f}" for t in trigs) or "none")],
             "cashAfter": round(cash - notional, 2),
             "placedBy": "runner",
+            # learning metadata: why this trade exists and under which policy
+            "mode": RUNNER_MODE, "entryReason": c.get("entryReason") or ("research" if alt else "blend"),
+            "primaryTrigger": primary,
         }
+        pv, pdet = pattern_signal(c["ticker"], patterns)
+        if pdet:
+            trade["pattern"] = {"value": round(pv, 3), "calls": pdet[:3], "scanAsOf": (patterns or {}).get("asOf")}
         if alt:
             det = alt.get("detail") or {}
             trade["assetClass"] = alt["assetClass"]
@@ -1540,6 +1690,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         committed += notional
         cash -= notional
         deployable -= notional
+        primary_count[primary] = primary_count.get(primary, 0) + 1
         state.setdefault("trades", []).append(trade)
         opened.append((c["ticker"], notional, c["score"]))
         if not state.get("startedAt"):
@@ -1655,9 +1806,10 @@ def main():
     # Research layer for crypto / futures (drivers, supply chain, news, regime,
     # seasonality) - shared cache for management + new entries.
     ctx["research"] = alt_research.ResearchData(fetch_json, RAW, universe, today)
+    ctx["patterns"] = load_patterns()
     closed = manage_open_positions(state, universe, today, ctx)
     opened = open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad, opt_market, fed,
-                             research=ctx["research"])
+                             research=ctx["research"], patterns=ctx["patterns"])
     recompute(state, universe, today)
 
     log(f"summary: +{len(opened)} opened · {len(closed)} closed · "
