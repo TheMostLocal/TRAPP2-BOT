@@ -19,16 +19,16 @@ this module builds an asset-specific research case from what actually drives it:
                 forward return from this point in the calendar (crop cycles,
                 driving / heating seasons). Futures only.
 
-The entry gate is STRICTER than for equities:
-  * technical score >= MIN_SCORE + 0.10, in the trade direction
-  * research composite >= 0.25 in the trade direction
-    (>= 0.35 when there is no news coverage - less evidence, higher bar)
+The entry gate is STRICTER than for equities (explore-mode values, precision in brackets):
+  * technical score >= MIN_SCORE + 0.05 [0.10], in the trade direction
+  * research composite >= 0.15 [0.25] in the trade direction
+    (>= 0.25 [0.35] when there is no news coverage - less evidence, higher bar)
   * coverage: drivers + at least two other research components present
   * no research component strongly against the trade (<= -0.50)
   * news not against the trade (<= -0.30) when there are >= 2 matched headlines
 Positions are smaller (crypto 0.5x, futures 0.6x the equity size, further scaled
 down by volatility), stops / targets are volatility-based, and concurrency is
-capped (2 crypto, 3 futures, 1 per futures complex). The full research case is
+capped (explore: 3 crypto, 5 futures, 2 per futures complex; precision: 2 / 3 / 1). The full research case is
 stored on the trade, so every entry can be audited.
 
 Every input is optional: a missing file or series just drops that component
@@ -39,15 +39,20 @@ import re
 from datetime import datetime, timezone
 
 # ----------------------------------------------------------------- config ----
-MIN_SCORE_BUMP = 0.10          # technical bar above the equity MIN_SCORE
-RESEARCH_MIN = 0.25            # research composite needed (with news)
-RESEARCH_MIN_NO_NEWS = 0.35    # ... without any news coverage
+# RUNNER_MODE=explore (default now) collects more trades for learning: lower bars
+# and more concurrent positions - but the same coverage rule and vetoes, so
+# nothing opens without its research case. precision = the original bars.
+import os as _os
+EXPLORE = (_os.environ.get("RUNNER_MODE") or "explore").strip().lower() != "precision"
+MIN_SCORE_BUMP = 0.05 if EXPLORE else 0.10        # technical bar above the equity MIN_SCORE
+RESEARCH_MIN = 0.15 if EXPLORE else 0.25          # research composite needed (with news)
+RESEARCH_MIN_NO_NEWS = 0.25 if EXPLORE else 0.35  # ... without any news coverage
 VETO = -0.50                   # any single component this far against = no trade
 NEWS_VETO = -0.30              # news this far against (>= 2 headlines) = no trade
 EXIT_FLIP = -0.25              # held position: research this far against = exit
 WEIGHTS = {"drivers": 0.30, "supplyChain": 0.25, "news": 0.20, "regime": 0.15, "seasonality": 0.10}
-MAX_OPEN = {"crypto": 2, "future": 3}
-MAX_PER_GROUP = 1              # futures complexes (energy, grains, ...)
+MAX_OPEN = {"crypto": 3, "future": 5} if EXPLORE else {"crypto": 2, "future": 3}
+MAX_PER_GROUP = 2 if EXPLORE else 1    # futures complexes (energy, grains, ...)
 SIZE_MULT = {"crypto": 0.5, "future": 0.6}
 TARGET_DAILY_VOL = {"crypto": 0.025, "future": 0.015}
 STOP_RULE = {"crypto": (2.5, 0.10, 0.22), "future": (2.0, 0.05, 0.12)}   # k*sigma*sqrt(10), clamp
