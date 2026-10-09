@@ -93,6 +93,8 @@ jobs:
           RUNNER_POSITION_PCT:     ${{ vars.RUNNER_POSITION_PCT }}
           RUNNER_CASH_RESERVE_PCT: ${{ vars.RUNNER_CASH_RESERVE_PCT }}
           RUNNER_MIN_SCORE:        ${{ vars.RUNNER_MIN_SCORE }}
+          # explore (default when unset) = quantity for learning data; precision = original strict settings
+          RUNNER_MODE:             ${{ vars.RUNNER_MODE }}
           RUNNER_DRY_RUN:          ${{ github.event.inputs.dry_run == 'true' && '1' || '' }}
         run: python pipeline/bot_runner.py
 
