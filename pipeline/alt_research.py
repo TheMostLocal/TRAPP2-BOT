@@ -382,6 +382,16 @@ class ResearchData:
             yoy_now = s[-1][1] / s[-13][1] - 1
             yoy_prev = s[-4][1] / s[-16][1] - 1
             return _clip((yoy_now - yoy_prev) / 0.01)          # 1pp accel in M2 growth = full
+        if name == "real_yield_chg":
+            # Market real yield = 10y Treasury - 10y breakeven inflation (T10YIE,
+            # added z82): what bond traders actually price. Falls back to the
+            # CPI-change proxy below until T10YIE is on disk.
+            nom, be = self.fred("DGS10"), self.fred("T10YIE")
+            if nom and be:
+                bed = dict(be)
+                real = [(d, v - bed[d]) for d, v in nom if d in bed]
+                if len(real) >= 70:
+                    return _clip((real[-1][1] - real[-64][1]) / 0.75)   # 75bp move in ~3 months = full
         if name in ("real_yield_chg", "y10_chg", "y2_chg"):
             sid = "DGS2" if name == "y2_chg" else "DGS10"
             s = self.fred(sid)
