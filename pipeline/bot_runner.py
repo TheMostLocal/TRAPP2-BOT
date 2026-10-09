@@ -983,20 +983,30 @@ def load_patterns():
     base = f"{RAW}/TRAPP2-ANALYTICS/main/data/patterns"
     sig = fetch_json(f"{base}/signals.json") or {}
     st = fetch_json(f"{base}/stats.json") or {}
-    rel = {}
+    rel, rel_src = {}, {}
+    now = ((st.get("regimeNow") or {}).get("trend")) or None
     for k, t in ((st.get("templates") or {}).items()):
         edge = ((t or {}).get("backtest") or {}).get("edgeVsBaselinePct")
+        src = "all"
+        # Regime-aware: use the template's record IN THE CURRENT MARKET REGIME
+        # (SPY trend: up / mixed / down) once it has enough judged calls - a 52-week
+        # breakout earns trust in up-trends and loses it in down-trends.
+        rg = (((t or {}).get("byRegime") or {}).get("trend") or {}).get(now or "")
+        if rg and rg.get("usable") and isinstance(rg.get("edgeVsBaselinePct"), (int, float)):
+            edge, src = rg["edgeVsBaselinePct"], now
         # earned trust: +4pp 20-day edge -> 1.0, no edge -> 0.5, negative -> floor 0.15
         rel[k] = max(0.15, min(1.0, 0.5 + (edge / 4.0))) if isinstance(edge, (int, float)) else 0.5
+        rel_src[k] = src
     by = {}
     for s in (sig.get("signals") or []):
         t = (s.get("ticker") or "").upper()
         if t:
             by.setdefault(t, []).append(s)
     log(f"patterns: {sum(len(v) for v in by.values())} recent identifications on {len(by)} tickers"
-        f" (scan {sig.get('asOf', '?')}); template trust " +
-        ", ".join(f"{k} {v:.2f}" for k, v in sorted(rel.items(), key=lambda x: -x[1])[:6]))
-    return {"by": by, "rel": rel, "asOf": sig.get("asOf")}
+        f" (scan {sig.get('asOf', '?')}; market trend regime {now or '?'}); template trust " +
+        ", ".join(f"{k} {v:.2f}{'' if rel_src.get(k) == 'all' else '*'}" for k, v in sorted(rel.items(), key=lambda x: -x[1])[:6])
+        + "  (* = current-regime record)")
+    return {"by": by, "rel": rel, "relSource": rel_src, "regime": now, "asOf": sig.get("asOf")}
 
 
 def pattern_signal(tk, pats):
@@ -1016,7 +1026,8 @@ def pattern_signal(tk, pats):
         if v:
             total += v
             parts.append({"template": s.get("template"), "status": s.get("status"),
-                          "identDate": s.get("identDate"), "trust": round(r, 2), "value": round(v, 3)})
+                          "identDate": s.get("identDate"), "trust": round(r, 2), "value": round(v, 3),
+                          "trustFrom": (pats.get("relSource") or {}).get(s.get("template"), "all")})
     if not parts:
         return None, None
     parts.sort(key=lambda x: -abs(x["value"]))
