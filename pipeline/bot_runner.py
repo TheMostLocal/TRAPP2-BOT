@@ -970,6 +970,35 @@ def blend_score(comps, weights, weight_mods):
     return max(-1.0, min(1.0, signed))
 
 
+# ----------------------------- bond trend context (z94) --------------------------
+# "It's the trend that matters, not the absolute level": a falling TLT (rising
+# long yields) gives investors a low-risk alternative to stocks. Tested on
+# 2006-2026 daily data the TLT 20/50-day trend did NOT forecast bigger 20-day
+# equity drawdowns on its own (see STATUS §1c); the stock-bond link flipped from
+# hedge (negative correlation, 2007-2020) to co-moving (positive, 2022+). So
+# this is recorded as OBSERVED CONTEXT on every trade - trend, slope, and the
+# 60-day stock/bond correlation - not as a score component. The trade journal
+# then shows whether entries made during TLT downtrends do worse; only proven
+# live evidence would promote it to a weighted signal.
+def bond_trend_context(spy_closes):
+    tlt = load_history("TLT", "TRAPP2") or load_history("TLT", "TRAPP2-1")
+    if not tlt or len(tlt) < 61 or not spy_closes or len(spy_closes) < 61:
+        return None
+    ma = lambda a, n: sum(a[-n:]) / n
+    m20, m50 = ma(tlt, 20), ma(tlt, 50)
+    slope10 = tlt[-1] / tlt[-11] - 1
+    trend = "down" if (m20 < m50 and slope10 < 0) else "up" if (m20 > m50 and slope10 > 0) else "mixed"
+    n = 60
+    rt = [tlt[i] / tlt[i - 1] - 1 for i in range(len(tlt) - n, len(tlt))]
+    rs = [spy_closes[i] / spy_closes[i - 1] - 1 for i in range(len(spy_closes) - n, len(spy_closes))]
+    mt, ms = sum(rt) / n, sum(rs) / n
+    cov = sum((a - mt) * (b - ms) for a, b in zip(rt, rs))
+    vt = math.sqrt(sum((a - mt) ** 2 for a in rt)); vs = math.sqrt(sum((b - ms) ** 2 for b in rs))
+    corr = cov / (vt * vs) if vt and vs else None
+    return {"trend": trend, "tlt": round(tlt[-1], 2), "ma20": round(m20, 2), "ma50": round(m50, 2),
+            "slope10Pct": round(slope10 * 100, 2), "stockBondCorr60": round(corr, 2) if corr is not None else None}
+
+
 # ----------------------------- regime certainty (z93) ---------------------------
 # Regime shifts are hard to predict. Before anything leans on the regime, ask
 # TRAPP2-1's regime_certainty.json whether the call is DIALED IN (margin,
@@ -1845,8 +1874,17 @@ def main():
             + (f" · {'; '.join((rc.get('why') or [])[:3])}" if rc else ""))
     else:
         log(f"regime certainty: {rc['certainty']:.2f} — dialed in ({rc.get('regime')}, quad {rc.get('quadNowcast')}) → regime-aware")
+    bond = None
+    try:
+        bond = bond_trend_context(spy_closes)
+    except Exception as e:
+        log(f"bond trend context failed: {e}")
+    if bond:
+        log(f"bond trend (context, not scored): TLT {bond['trend']} · {bond['tlt']} vs MA20 {bond['ma20']} / MA50 {bond['ma50']} · "
+            f"10d {bond['slope10Pct']:+.2f}% · stock/bond corr60 {bond['stockBondCorr60']}")
     regime_ctx = {"regime": (rc or {}).get("regime"), "quad": (rc or {}).get("quadNowcast"),
-                  "certainty": (rc or {}).get("certainty"), "dialedIn": not agnostic, "botMode": regime.get("mode")}
+                  "certainty": (rc or {}).get("certainty"), "dialedIn": not agnostic, "botMode": regime.get("mode"),
+                  "bondTrend": bond}
     # ex-post: mark every trade whose entry-day regime call has since been judged
     outcomes = regime_call_outcomes(rc)
     for t in trades_list(state):
