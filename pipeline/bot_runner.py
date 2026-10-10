@@ -970,6 +970,28 @@ def blend_score(comps, weights, weight_mods):
     return max(-1.0, min(1.0, signed))
 
 
+# ----------------------------- regime certainty (z93) ---------------------------
+# Regime shifts are hard to predict. Before anything leans on the regime, ask
+# TRAPP2-1's regime_certainty.json whether the call is DIALED IN (margin,
+# stability, quad agreement, cross-check, track record). If it isn't - or the
+# file can't be read - the bot runs REGIME-AGNOSTIC: no regime weight tilts, no
+# regime entry bar, no regime-based sector grade, no regime component in the
+# crypto/futures research, pattern trust from ALL regimes. Trades then rest on
+# company-level and price evidence instead of a shaky macro call.
+def load_regime_certainty():
+    rc = fetch_json(f"{RAW}/TRAPP2-1/main/data/regime_certainty.json", timeout=20)
+    return rc if isinstance(rc, dict) and "certainty" in rc else None
+
+
+def regime_call_outcomes(rc):
+    """date -> was that day's regime call right (21-session SPY outcome)?"""
+    out = {}
+    for c in ((rc or {}).get("calls") or []):
+        if c.get("date") and "correct" in c:
+            out[c["date"]] = bool(c["correct"])
+    return out
+
+
 # ----------------------------- chart-pattern factor ---------------------------
 PATTERN_STATUS_W = {"confirmed": 1.0, "identified": 0.6, "open": 0.6, "timeout": 0.3,
                     "success": 0.35,       # already hit its target - less left
@@ -977,14 +999,14 @@ PATTERN_STATUS_W = {"confirmed": 1.0, "identified": 0.6, "open": 0.6, "timeout":
                     "failure": -0.4, "expired": 0.0}
 
 
-def load_patterns():
+def load_patterns(use_regime=True):
     """Recent identifications from the patterns engine + each template's
     backtest edge. -> {"by": {TICKER: [signal, ...]}, "rel": {template: 0..1}}"""
     base = f"{RAW}/TRAPP2-ANALYTICS/main/data/patterns"
     sig = fetch_json(f"{base}/signals.json") or {}
     st = fetch_json(f"{base}/stats.json") or {}
     rel, rel_src = {}, {}
-    now = ((st.get("regimeNow") or {}).get("trend")) or None
+    now = ((st.get("regimeNow") or {}).get("trend")) if use_regime else None
     for k, t in ((st.get("templates") or {}).items()):
         edge = ((t or {}).get("backtest") or {}).get("edgeVsBaselinePct")
         src = "all"
@@ -1219,7 +1241,7 @@ def score_symbol(tk, u, ctx):
     pg = peer_grade_signal(tk, u.get("sector"), ctx["peer_ranks"])
     if pg is not None:
         comps["peerGrade"] = pg
-    rg = regime_grade_signal(u.get("sector"), u.get("beta"), ctx["mode"], ctx["quad"])
+    rg = None if ctx.get("regime_agnostic") else regime_grade_signal(u.get("sector"), u.get("beta"), ctx["mode"], ctx["quad"])
     if rg is not None:
         comps["regimeGrade"] = rg
     ca = cross_asset_for_sector(u.get("sector"), ctx["xa"])
@@ -1438,7 +1460,7 @@ def _alt_class_group(pos):
 
 # ----------------------------- open new trades --------------------------------
 def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad, opt_market=None, fed=None,
-                    research=None, patterns=None):
+                    research=None, patterns=None, regime_ctx=None):
     bankroll = state.get("bankroll", STARTING_BANKROLL)
     held = {(p.get("ticker") or "").upper() for p in trades_list(state) if p.get("status") == "open"}
     n_open = len(held)
@@ -1456,7 +1478,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
     ctx = {"weights": weights, "weight_mods": weight_mods, "mode": mode,
            "peer_ranks": peer_ranks, "xa": xa, "quad": quad,
            "opt_market": opt_market, "fed": fed, "grades": grades, "research": research,
-           "patterns": patterns}
+           "patterns": patterns, "regime_agnostic": not (regime_ctx or {}).get("dialedIn", False)}
     pat_seen = {"aligned": 0, "nudged": 0, "overruled": 0}
     alt_seen = {"crypto": 0, "future": 0}
     alt_rejects = {}
@@ -1674,6 +1696,9 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             # learning metadata: why this trade exists and under which policy
             "mode": RUNNER_MODE, "entryReason": c.get("entryReason") or ("research" if alt else "blend"),
             "primaryTrigger": primary,
+            # what the bot believed about the regime when it entered, and whether
+            # it used it - so a win can't credit a regime call that was wrong
+            "regimeContext": regime_ctx,
         }
         pv, pdet = pattern_signal(c["ticker"], patterns)
         if pdet:
@@ -1810,6 +1835,24 @@ def main():
     log(f"regime: {regime['mode']}{regime.get('optNote','')} · {quad_note} · cross-asset: {', '.join(xa_have) or 'none'} · "
         f"peer-ranked sectors cover {len(peer_ranks)} tickers{opt_note}{fed_note}")
 
+    rc = load_regime_certainty()
+    agnostic = not (rc and rc.get("dialedIn"))
+    if agnostic:
+        regime = dict(regime, weightMods={}, longBar=0.0)       # neutral tilts, base entry bar
+        quad = None                                              # no quad-based sector grade / research regime
+        log(f"regime certainty: {('%.2f' % rc['certainty']) if rc else 'unavailable'} — NOT dialed in → REGIME-AGNOSTIC "
+            f"(no regime tilts, no regimeGrade, pattern trust from all regimes)"
+            + (f" · {'; '.join((rc.get('why') or [])[:3])}" if rc else ""))
+    else:
+        log(f"regime certainty: {rc['certainty']:.2f} — dialed in ({rc.get('regime')}, quad {rc.get('quadNowcast')}) → regime-aware")
+    regime_ctx = {"regime": (rc or {}).get("regime"), "quad": (rc or {}).get("quadNowcast"),
+                  "certainty": (rc or {}).get("certainty"), "dialedIn": not agnostic, "botMode": regime.get("mode")}
+    # ex-post: mark every trade whose entry-day regime call has since been judged
+    outcomes = regime_call_outcomes(rc)
+    for t in trades_list(state):
+        d = t.get("entryDate")
+        if d in outcomes:
+            t["regimeCallCorrect"] = outcomes[d]
     weights = state.get("learnedWeights", {}) if isinstance(state.get("learnedWeights"), dict) else {}
     ctx = {"weights": weights, "weight_mods": regime.get("weightMods", {}),
            "mode": regime.get("mode", "choppy"), "peer_ranks": peer_ranks,
@@ -1817,10 +1860,11 @@ def main():
     # Research layer for crypto / futures (drivers, supply chain, news, regime,
     # seasonality) - shared cache for management + new entries.
     ctx["research"] = alt_research.ResearchData(fetch_json, RAW, universe, today)
-    ctx["patterns"] = load_patterns()
+    ctx["patterns"] = load_patterns(use_regime=not agnostic)
+    ctx["regime_agnostic"] = agnostic
     closed = manage_open_positions(state, universe, today, ctx)
     opened = open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad, opt_market, fed,
-                             research=ctx["research"], patterns=ctx["patterns"])
+                             research=ctx["research"], patterns=ctx["patterns"], regime_ctx=regime_ctx)
     recompute(state, universe, today)
 
     log(f"summary: +{len(opened)} opened · {len(closed)} closed · "
