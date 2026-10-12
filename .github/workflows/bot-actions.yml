@@ -1,0 +1,62 @@
+name: Bot · apply app actions (every 15 min)
+
+# z100 — the app and the runner both trade the bot's book. The app never writes
+# data/bot_training_data.json (that would race the runner); it drops one file
+# per action into data/app_actions/ and dispatches this workflow. This pass
+# applies those actions (open / close / trim / deposit / withdrawal) with the
+# runner's accounting, refreshes the summary and commits - no new-trade scan
+# (that stays in bot-runner.yml). It also runs every 15 minutes in US market
+# hours so nothing waits for the nightly run.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 13-20 * * 1-5'
+
+# Same group as bot-runner.yml: the two never write the state file at once.
+concurrency:
+  group: bot-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  actions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Anything to apply?
+        id: inbox
+        run: |
+          n=$(ls data/app_actions/*.json 2>/dev/null | wc -l)
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "app actions waiting: $n"
+
+      - uses: actions/setup-python@v5
+        if: ${{ steps.inbox.outputs.count != '0' }}
+        with:
+          python-version: '3.12'
+
+      - name: Apply app actions
+        if: ${{ steps.inbox.outputs.count != '0' }}
+        env:
+          RUNNER_ACTIONS_ONLY: '1'
+        run: python pipeline/bot_runner.py --actions-only
+
+      - name: Commit (bot scope only, retry, never force)
+        if: ${{ steps.inbox.outputs.count != '0' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A data/bot_training_data.json data/app_actions/ 2>/dev/null || true
+          if git diff --staged --quiet; then echo "No state change"; exit 0; fi
+          git commit -m "Bot: applied app actions $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          for i in 1 2 3 4 5; do
+            if git push; then echo "Pushed on attempt $i"; exit 0; fi
+            git fetch origin
+            git merge -X ours origin/${{ github.ref_name }} --no-edit 2>/dev/null || true
+            sleep 4
+          done
+          echo "::error::push failed after 5 attempts"; exit 1
