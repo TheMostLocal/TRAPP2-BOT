@@ -1873,6 +1873,27 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
 
 
 # ----------------------------- performance + equity ---------------------------
+def _perf_by_regime_mode(closed, pl):
+    """z101 - did trades do better when the regime was trusted? Closed trades split
+    by the regime context recorded at entry: regime-aware (dialed in) vs regime-
+    agnostic vs unknown (older trades), and by whether the entry-day regime call
+    later proved right. Evidence for (or against) leaning on the regime."""
+    def stats(rows):
+        if not rows:
+            return {"n": 0}
+        w = [r for r in rows if pl(r) > 0]
+        return {"n": len(rows), "winRate": round(len(w) / len(rows), 3),
+                "avgPnl": round(sum(pl(r) for r in rows) / len(rows), 2), "totalPnl": round(sum(pl(r) for r in rows), 2)}
+    rc = lambda b: (b.get("regimeContext") or {})
+    return {
+        "aware": stats([b for b in closed if rc(b).get("dialedIn") is True]),
+        "agnostic": stats([b for b in closed if rc(b).get("dialedIn") is False]),
+        "unknown": stats([b for b in closed if "dialedIn" not in rc(b)]),
+        "callRight": stats([b for b in closed if b.get("regimeCallCorrect") is True]),
+        "callWrong": stats([b for b in closed if b.get("regimeCallCorrect") is False]),
+    }
+
+
 def recompute(state, universe, today):
     bets = trades_list(state)
     closed = [b for b in bets if b.get("status") == "closed"]
@@ -1898,7 +1919,8 @@ def recompute(state, universe, today):
     state["counts"] = {"total": len(bets), "open": len(open_b), "closed": len(closed),
                        "wins": len(wins), "losses": len(losses)}
     state["performance"] = {"winRate": win_rate, "totalPnl": total_pnl,
-                            "avgWin": avg_win, "avgLoss": avg_loss, "profitFactor": pf}
+                            "avgWin": avg_win, "avgLoss": avg_loss, "profitFactor": pf,
+                            "byRegimeMode": _perf_by_regime_mode(closed, _pl)}
     state["allTimeReturnPct"] = round((state.get("bankroll", STARTING_BANKROLL) - STARTING_BANKROLL)
                                       / STARTING_BANKROLL * 100, 2)
     state["openPositions"] = [{"ticker": b["ticker"], "direction": b.get("direction"),
