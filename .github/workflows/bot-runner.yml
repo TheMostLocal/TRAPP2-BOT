@@ -120,6 +120,8 @@ jobs:
           fi
           # THE PATH THAT MATTERS: this is what supabase-sync.yml watches.
           git add -A data/bot_training_data.json bot_training_data.json 2>/dev/null || true
+          # z100: app actions the runner applied are deleted from the inbox
+          git add -A data/app_actions/ 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "No state change to commit"
           else
