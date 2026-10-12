@@ -1086,6 +1086,113 @@ def pattern_signal(tk, pats):
 
 
 # ----------------------------- position management ----------------------------
+# ----------------------------- app ↔ runner (z100) -----------------------------
+# Both the app and this runner may trade the bot's book. The runner is the one
+# that runs on a schedule; the app can still open / close / trim / add cash by
+# hand. The app never edits this repo's state file (that would race the runner):
+# it drops one small file per action into data/app_actions/ (creating a NEW file
+# never conflicts) and dispatches bot-actions.yml. Every run - the full nightly
+# scan and the 15-minute actions pass - applies those files first, in time
+# order, exactly once (ids remembered in state["appliedActions"]), then deletes
+# them. Accounting is the runner's: a trim credits the bankroll when it happens
+# and is tracked in trims[] / realizedTrim; a close credits the remainder and
+# folds realizedTrim into pnl - so the app and the runner keep one ledger.
+APP_ACTIONS_DIR = ROOT / "data" / "app_actions"
+ACTIONS_ONLY = ("--actions-only" in sys.argv) or os.environ.get("RUNNER_ACTIONS_ONLY") == "1"
+
+
+def apply_app_actions(state, today):
+    if not APP_ACTIONS_DIR.exists():
+        return []
+    files = sorted(APP_ACTIONS_DIR.glob("*.json"))
+    if not files:
+        return []
+    actions = []
+    for f in files:
+        try:
+            a = json.loads(f.read_text())
+            a["_file"] = f
+            actions.append(a)
+        except Exception as e:
+            log(f"  app action {f.name} unreadable ({e}) — left in place")
+    actions.sort(key=lambda a: str(a.get("ts") or ""))
+    applied = state.setdefault("appliedActions", [])
+    seen = {x.get("id") for x in applied}
+    trades = trades_list(state)
+    by_id = {t.get("id"): t for t in trades if t.get("id")}
+    done = []
+    for a in actions:
+        aid, kind = a.get("id"), a.get("type")
+        if not aid or aid in seen:
+            a["_file"].unlink(missing_ok=True)
+            continue
+        note = ""
+        try:
+            if kind == "open":
+                t = dict(a.get("trade") or {})
+                if t.get("id") and t["id"] not in by_id and t.get("ticker") and _f(t.get("entryPrice")):
+                    t.setdefault("status", "open")
+                    t["origin"] = "app"
+                    t.setdefault("entryDate", today)
+                    if not t.get("shares") and _f(t.get("notional")):
+                        t["shares"] = round(_f(t["notional"]) / _f(t["entryPrice"]), 6)
+                    trades.append(t)
+                    by_id[t["id"]] = t
+                    note = f"opened {t.get('direction', 'long')} {t['ticker']} {t.get('shares')} @ {t['entryPrice']}"
+                else:
+                    note = "open skipped (exists or incomplete)"
+            elif kind in ("close", "trim"):
+                t = by_id.get(a.get("tradeId"))
+                px = _f(a.get("price"))
+                if not t or t.get("status") != "open" or not px:
+                    note = f"{kind} skipped (trade not open here or no price)"
+                elif kind == "trim":
+                    sh = _f(a.get("shares")) or 0
+                    cur = _f(t.get("shares")) or 0
+                    if 0 < sh < cur:
+                        entry = _f(t.get("entryPrice"))
+                        d = -1 if t.get("direction") == "short" else 1
+                        realized = round(d * (px - entry) * sh, 2)
+                        t["shares"] = round(cur - sh, 6)
+                        t["notional"] = round(t["shares"] * entry, 2)
+                        t.setdefault("trims", []).append({"date": a.get("date") or today, "shares": sh, "price": px,
+                                                          "realized": realized, "origin": "app"})
+                        t["realizedTrim"] = round((t.get("realizedTrim") or 0) + realized, 2)
+                        state["bankroll"] = round(state.get("bankroll", STARTING_BANKROLL) + realized, 2)
+                        note = f"trimmed {t['ticker']} {sh} @ {px} → {realized:+.2f}"
+                    else:
+                        note = "trim skipped (shares out of range)"
+                else:
+                    r = realized_pnl(t, px)
+                    t.update(status="closed", exitDate=a.get("date") or today, exitPrice=px,
+                             exitReason=a.get("reason") or "app-manual")
+                    total = round(r + (t.get("realizedTrim") or 0), 2)
+                    t["realizedPL"] = t["pnl"] = total
+                    t["won"] = total > 0
+                    state["bankroll"] = round(state.get("bankroll", STARTING_BANKROLL) + r, 2)
+                    note = f"closed {t['ticker']} @ {px} → {total:+.2f}"
+            elif kind in ("deposit", "withdrawal"):
+                amt = _f(a.get("amount")) or 0
+                state["bankroll"] = round(state.get("bankroll", STARTING_BANKROLL) + amt, 2)
+                state["cashAdded"] = round((state.get("cashAdded") or 0) + amt, 2)
+                state.setdefault("transactions", []).append({"id": aid, "ts": a.get("ts"), "type": kind,
+                                                             "amount": amt, "origin": "app"})
+                note = f"{kind} {amt:+,.2f}"
+            else:
+                note = f"unknown action type {kind!r} — ignored"
+        except Exception as e:
+            note = f"failed: {type(e).__name__}: {e}"
+        applied.append({"id": aid, "type": kind, "appliedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        "note": note})
+        seen.add(aid)
+        done.append(note)
+        log(f"  app action {aid} ({kind}): {note}")
+        if not DRY_RUN:
+            a["_file"].unlink(missing_ok=True)
+    state["appliedActions"] = applied[-2000:]
+    return done
+
+
 def realized_pnl(pos, exit_price):
     """Shares-based realized P&L — identical to the app's z35 freeze (long-only here)."""
     shares = pos.get("shares")
@@ -1828,10 +1935,26 @@ def main():
         f"{sum(1 for b in trades_list(state) if b.get('status')=='open')} open · "
         f"{len(trades_list(state))} total trades")
 
+    # app-made trades first, so tonight's decisions see them (z100)
+    app_done = apply_app_actions(state, today)
+    if app_done:
+        log(f"applied {len(app_done)} app action(s)")
+
     universe = load_universe()
     if not universe:
         log("✗ no universe data — aborting (won't write empty state)")
         sys.exit(1)
+
+    if ACTIONS_ONLY:
+        # 15-minute pass: app actions + fresh marks, no new-trade scan.
+        recompute(state, universe, today)
+        if DRY_RUN:
+            log("DRY RUN — not writing state.")
+            return
+        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps(state, separators=(",", ":")))
+        log(f"actions-only pass: {len(app_done)} applied · bankroll ${state['bankroll']:,.2f} · wrote {STATE_FILE}")
+        return
 
     # Macro + cross-sectional context (faithful peer-grade + regime signals).
     grades = load_grades()
