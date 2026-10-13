@@ -1028,6 +1028,10 @@ PATTERN_STATUS_W = {"confirmed": 1.0, "identified": 0.6, "open": 0.6, "timeout":
                     "failure": -0.4, "expired": 0.0}
 
 
+LIVE_MIN_N = 15        # live calls judged before the live record counts at all
+LIVE_PRIOR_N = 60      # live calls at which live and backtest weigh equally
+
+
 def load_patterns(use_regime=True):
     """Recent identifications from the patterns engine + each template's
     backtest edge. -> {"by": {TICKER: [signal, ...]}, "rel": {template: 0..1}}"""
@@ -1046,6 +1050,19 @@ def load_patterns(use_regime=True):
         rg = (((t or {}).get("byRegime") or {}).get("trend") or {}).get(now or "")
         if rg and rg.get("usable") and isinstance(rg.get("edgeVsBaselinePct"), (int, float)):
             edge, src = rg["edgeVsBaselinePct"], now
+        # z104: backtest -> LIVE transition. The live record (calls made since the
+        # live ledger started, judged only on later bars) is the honest test. Blend
+        # it in by sample size against a fixed prior weight for the backtest, so
+        # live evidence takes over as it accumulates (at LIVE_PRIOR_N live calls
+        # it carries half the weight) and a backtest edge that doesn't hold live
+        # loses trust.
+        live = (t or {}).get("live") or {}
+        ln, le = live.get("judged") or 0, live.get("edgeVsBaselinePct")
+        w = 0.0
+        if ln >= LIVE_MIN_N and isinstance(le, (int, float)) and isinstance(edge, (int, float)):
+            w = ln / (ln + LIVE_PRIOR_N)
+            edge = (1 - w) * edge + w * le
+            src = f"{src}+live{ln}"
         # earned trust: +4pp 20-day edge -> 1.0, no edge -> 0.5, negative -> floor 0.15
         rel[k] = max(0.15, min(1.0, 0.5 + (edge / 4.0))) if isinstance(edge, (int, float)) else 0.5
         # z103: breakout-volume split (patterns-v3) - a volume-confirmed call
@@ -1053,6 +1070,8 @@ def load_patterns(use_regime=True):
         for vk, vs in (((t or {}).get("byVolume") or {}).items()):
             ve = (vs or {}).get("edgeVsBaselinePct")
             if (vs or {}).get("usable") and isinstance(ve, (int, float)):
+                if w:                                    # same live blend as the template trust
+                    ve = (1 - w) * ve + w * le
                 rel_vol.setdefault(k, {})[vk] = max(0.15, min(1.0, 0.5 + (ve / 4.0)))
         rel_src[k] = src
     by = {}
@@ -1063,7 +1082,7 @@ def load_patterns(use_regime=True):
     log(f"patterns: {sum(len(v) for v in by.values())} recent identifications on {len(by)} tickers"
         f" (scan {sig.get('asOf', '?')}; market trend regime {now or '?'}); template trust " +
         ", ".join(f"{k} {v:.2f}{'' if rel_src.get(k) == 'all' else '*'}" for k, v in sorted(rel.items(), key=lambda x: -x[1])[:6])
-        + "  (* = current-regime record)")
+        + "  (* = current-regime and/or live-blended record)")
     return {"by": by, "rel": rel, "relVol": rel_vol, "relSource": rel_src, "regime": now, "asOf": sig.get("asOf")}
 
 
