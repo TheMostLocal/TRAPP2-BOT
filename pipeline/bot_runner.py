@@ -1036,6 +1036,7 @@ def load_patterns(use_regime=True):
     st = fetch_json(f"{base}/stats.json") or {}
     rel, rel_src = {}, {}
     now = ((st.get("regimeNow") or {}).get("trend")) if use_regime else None
+    rel_vol = {}
     for k, t in ((st.get("templates") or {}).items()):
         edge = ((t or {}).get("backtest") or {}).get("edgeVsBaselinePct")
         src = "all"
@@ -1047,6 +1048,12 @@ def load_patterns(use_regime=True):
             edge, src = rg["edgeVsBaselinePct"], now
         # earned trust: +4pp 20-day edge -> 1.0, no edge -> 0.5, negative -> floor 0.15
         rel[k] = max(0.15, min(1.0, 0.5 + (edge / 4.0))) if isinstance(edge, (int, float)) else 0.5
+        # z103: breakout-volume split (patterns-v3) - a volume-confirmed call
+        # earns the confirmed record's trust, a light-volume call the other.
+        for vk, vs in (((t or {}).get("byVolume") or {}).items()):
+            ve = (vs or {}).get("edgeVsBaselinePct")
+            if (vs or {}).get("usable") and isinstance(ve, (int, float)):
+                rel_vol.setdefault(k, {})[vk] = max(0.15, min(1.0, 0.5 + (ve / 4.0)))
         rel_src[k] = src
     by = {}
     for s in (sig.get("signals") or []):
@@ -1057,7 +1064,7 @@ def load_patterns(use_regime=True):
         f" (scan {sig.get('asOf', '?')}; market trend regime {now or '?'}); template trust " +
         ", ".join(f"{k} {v:.2f}{'' if rel_src.get(k) == 'all' else '*'}" for k, v in sorted(rel.items(), key=lambda x: -x[1])[:6])
         + "  (* = current-regime record)")
-    return {"by": by, "rel": rel, "relSource": rel_src, "regime": now, "asOf": sig.get("asOf")}
+    return {"by": by, "rel": rel, "relVol": rel_vol, "relSource": rel_src, "regime": now, "asOf": sig.get("asOf")}
 
 
 def pattern_signal(tk, pats):
@@ -1073,12 +1080,19 @@ def pattern_signal(tk, pats):
         d = 1 if s.get("direction") == "bullish" else -1
         w = PATTERN_STATUS_W.get(s.get("status"), 0.0)
         r = pats["rel"].get(s.get("template"), 0.5)
+        vc = s.get("volConfirmed")
+        rv = (pats.get("relVol") or {}).get(s.get("template")) or {}
+        if vc is True and "confirmed" in rv:
+            r = rv["confirmed"]
+        elif vc is False and "unconfirmed" in rv:
+            r = rv["unconfirmed"]
         v = d * w * r
         if v:
             total += v
             parts.append({"template": s.get("template"), "status": s.get("status"),
                           "identDate": s.get("identDate"), "trust": round(r, 2), "value": round(v, 3),
-                          "trustFrom": (pats.get("relSource") or {}).get(s.get("template"), "all")})
+                          "trustFrom": (pats.get("relSource") or {}).get(s.get("template"), "all"),
+                          "volConfirmed": vc})
     if not parts:
         return None, None
     parts.sort(key=lambda x: -abs(x["value"]))
