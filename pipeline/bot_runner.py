@@ -999,6 +999,24 @@ def bond_trend_context(spy_closes):
             "slope10Pct": round(slope10 * 100, 2), "stockBondCorr60": round(corr, 2) if corr is not None else None}
 
 
+# ----------------------------- Fed context (z105) ------------------------------
+# QE/QT stance, net-liquidity trend and the latest FOMC statement's tone from
+# TRAPP2-1's Fed monitor. Like the bond trend: OBSERVED context recorded on every
+# trade (regimeContext.fed) and logged - not a scored factor - until the trade
+# record shows it adds something.
+def fed_context():
+    m = fetch_json(f"{RAW}/TRAPP2-1/main/data/fed/monitor.json", timeout=20)
+    if not isinstance(m, dict):
+        return None
+    bs, st = m.get("balanceSheet") or {}, m.get("statement") or {}
+    nl = bs.get("netLiquidity") or []
+    nl13 = round(nl[-1][1] - nl[-14][1], 1) if len(nl) >= 14 else None
+    return {"stance": bs.get("stance"), "monthlyPaceBn": bs.get("monthlyPaceBn"),
+            "netLiquidityBn": bs.get("netLiquidityBn"), "netLiquidity13wBn": nl13,
+            "statementTone": st.get("tone"), "toneChange": st.get("toneChange"), "statementDate": st.get("date"),
+            "asOf": m.get("generatedAt")}
+
+
 # ----------------------------- regime certainty (z93) ---------------------------
 # Regime shifts are hard to predict. Before anything leans on the regime, ask
 # TRAPP2-1's regime_certainty.json whether the call is DIALED IN (margin,
@@ -2060,9 +2078,18 @@ def main():
     if bond:
         log(f"bond trend (context, not scored): TLT {bond['trend']} · {bond['tlt']} vs MA20 {bond['ma20']} / MA50 {bond['ma50']} · "
             f"10d {bond['slope10Pct']:+.2f}% · stock/bond corr60 {bond['stockBondCorr60']}")
+    fed = None
+    try:
+        fed = fed_context()
+    except Exception as e:
+        log(f"fed context failed: {e}")
+    if fed:
+        log(f"fed (context, not scored): {fed.get('stance')} · pace {fed.get('monthlyPaceBn')}bn/mo · net liquidity "
+            f"{fed.get('netLiquidityBn')}bn (13w {fed.get('netLiquidity13wBn')}) · statement tone {fed.get('statementTone')}"
+            f" (Δ {fed.get('toneChange')})")
     regime_ctx = {"regime": (rc or {}).get("regime"), "quad": (rc or {}).get("quadNowcast"),
                   "certainty": (rc or {}).get("certainty"), "dialedIn": not agnostic, "botMode": regime.get("mode"),
-                  "bondTrend": bond}
+                  "bondTrend": bond, "fed": fed}
     # ex-post: mark every trade whose entry-day regime call has since been judged
     outcomes = regime_call_outcomes(rc)
     for t in trades_list(state):
