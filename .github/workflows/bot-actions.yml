@@ -1,4 +1,4 @@
-name: Bot · apply app actions (every 15 min)
+name: Bot · apply app actions + Supabase sync (every 15 min)
 
 # z100 — the app and the runner both trade the bot's book. The app never writes
 # data/bot_training_data.json (that would race the runner); it drops one file
@@ -31,8 +31,11 @@ jobs:
         id: inbox
         run: |
           n=$(ls data/app_actions/*.json 2>/dev/null | wc -l)
+          # z112: also run when Supabase is configured - the pass pulls trades the
+          # app wrote to Supabase (works without a GitHub token on the device)
+          if [ -n "${{ secrets.SUPABASE_URL }}" ]; then n=$((n + 1)); fi
           echo "count=$n" >> "$GITHUB_OUTPUT"
-          echo "app actions waiting: $n"
+          echo "work waiting (inbox files + Supabase pull): $n"
 
       - uses: actions/setup-python@v5
         if: ${{ steps.inbox.outputs.count != '0' }}
@@ -43,6 +46,9 @@ jobs:
         if: ${{ steps.inbox.outputs.count != '0' }}
         env:
           RUNNER_ACTIONS_ONLY: '1'
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python pipeline/bot_runner.py --actions-only
 
       - name: Commit (bot scope only, retry, never force)
@@ -60,3 +66,13 @@ jobs:
             sleep 4
           done
           echo "::error::push failed after 5 attempts"; exit 1
+
+      - name: Mirror trades to Supabase (repo wins only where it's newer)
+        if: ${{ steps.inbox.outputs.count != '0' }}
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE: ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          if [ -n "$SUPABASE_URL" ]; then python pipeline/sync_bot_to_supabase.py; else echo "Supabase not configured"; fi
