@@ -96,6 +96,10 @@ jobs:
           # explore (default when unset) = quantity for learning data; precision = original strict settings
           RUNNER_MODE:             ${{ vars.RUNNER_MODE }}
           RUNNER_DRY_RUN:          ${{ github.event.inputs.dry_run == 'true' && '1' || '' }}
+          # z112: the runner PULLS bot_trades from Supabase first (trades the app wrote)
+          SUPABASE_URL:            ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE:   ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          SUPABASE_SERVICE_KEY:    ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: python pipeline/bot_runner.py
 
       - name: Verify the runner actually wrote its state file
