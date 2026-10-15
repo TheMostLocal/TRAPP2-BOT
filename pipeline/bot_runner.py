@@ -48,6 +48,7 @@ Stdlib only (urllib + json + math). No pip installs.
 import json
 import math
 import os
+import trade_sync as ts
 import sys
 import urllib.request
 import urllib.error
@@ -1152,6 +1153,94 @@ APP_ACTIONS_DIR = ROOT / "data" / "app_actions"
 ACTIONS_ONLY = ("--actions-only" in sys.argv) or os.environ.get("RUNNER_ACTIONS_ONLY") == "1"
 
 
+# ----------------------------- Supabase pull (z112) ----------------------------
+# The app writes bot trades straight to Supabase (bot_trades, anon key) - that
+# works on every device even without a GitHub token. So each run first PULLS
+# Supabase: trades the repo doesn't have are stored here; for trades both have,
+# trade_sync.winner() picks the version (a close beats open, more trims beat
+# fewer, else the later updatedAt). The bankroll is then derived from the
+# journal (trade_sync.ledger_bankroll), the same rule the app uses, so a trade
+# that arrives by any path is accounted for exactly once.
+def _sb_env():
+    url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
+    key = (os.environ.get("SUPABASE_SERVICE_KEY") or os.environ.get("SUPABASE_SERVICE_ROLE") or "").strip()
+    return url, key
+
+
+def _sig(t):
+    return (t.get("status"), round(float(t.get("shares") or 0), 6), len(t.get("trims") or []), t.get("exitDate"))
+
+
+def stamp_changes(state, before):
+    """updatedAt = now on every trade this run opened / closed / trimmed, so the
+    Supabase merge (trade_sync.winner) knows this is the newer version."""
+    now, n = ts.now_iso(), 0
+    for t in trades_list(state):
+        if before.get(t.get("id")) != _sig(t):
+            t["updatedAt"] = now
+            n += 1
+    return n
+
+
+def finalize_state(state, before):
+    n = stamp_changes(state, before)
+    derived = ts.ledger_bankroll(state, STARTING_BANKROLL)
+    if abs((state.get("bankroll") or 0) - derived) >= 0.01:
+        log(f"bankroll check: running {state.get('bankroll'):,.2f} vs journal {derived:,.2f} → journal wins")
+    state["bankroll"] = derived
+    if n:
+        log(f"stamped updatedAt on {n} changed trade(s)")
+
+
+def pull_supabase_trades(state):
+    url, key = _sb_env()
+    if not url or not key:
+        log("supabase pull: skipped (no SUPABASE_URL / service key in this job)")
+        return {"skipped": True}
+    import urllib.request
+    rows, offset = [], 0
+    try:
+        while True:
+            req = urllib.request.Request(f"{url}/rest/v1/bot_trades?select=id,trade,updated_at&order=id&limit=1000&offset={offset}",
+                                         headers={"apikey": key, "Authorization": f"Bearer {key}"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                page = json.loads(r.read().decode())
+            rows += page
+            if len(page) < 1000:
+                break
+            offset += 1000
+    except Exception as e:
+        log(f"supabase pull: failed ({type(e).__name__}: {e}) — continuing with the repo journal")
+        return {"error": str(e)}
+    trades = trades_list(state)
+    by_id = {t.get("id"): t for t in trades if t.get("id")}
+    added = updated = 0
+    for row in rows:
+        t = row.get("trade") if isinstance(row, dict) else None
+        tid = (t or {}).get("id") or (row or {}).get("id")
+        if not isinstance(t, dict) or not tid:
+            continue
+        t["id"] = tid
+        if tid not in by_id:
+            t.setdefault("origin", "app")
+            t["_via"] = "supabase"
+            trades.append(t)
+            by_id[tid] = t
+            added += 1
+            log(f"  supabase → repo: stored {t.get('status', '?')} {t.get('ticker')} ({tid})")
+            continue
+        loc = by_id[tid]
+        if ts.winner(loc, t) == "remote":
+            for k in ts.STATUS_FIELDS:
+                if k in t:
+                    loc[k] = t[k]
+            loc["_via"] = "supabase"
+            updated += 1
+            log(f"  supabase → repo: updated {loc.get('ticker')} ({tid}) → {loc.get('status')}")
+    log(f"supabase pull: {len(rows)} row(s) · {added} new trade(s) stored · {updated} updated from the app")
+    return {"rows": len(rows), "added": added, "updated": updated}
+
+
 def apply_app_actions(state, today):
     if not APP_ACTIONS_DIR.exists():
         return []
@@ -2008,8 +2097,26 @@ def main():
         f"{sum(1 for b in trades_list(state) if b.get('status')=='open')} open · "
         f"{len(trades_list(state))} total trades")
 
-    # app-made trades first, so tonight's decisions see them (z100)
+    # trades the app wrote to Supabase first (z112), then the GitHub inbox (z100)
+    sb_pull = pull_supabase_trades(state)
     app_done = apply_app_actions(state, today)
+    # bankroll derived from the journal - the same rule the app uses (z112).
+    # First time only: if the stored bankroll isn't backed by recorded trades, the
+    # gap is written down as ONE explicit adjustment (never silently dropped), so
+    # the balance carries over and the ledger says where it came from.
+    before = state.get("bankroll")
+    if not state.get("ledgerVersion"):
+        gap = round((before or STARTING_BANKROLL) - ts.ledger_bankroll(state, STARTING_BANKROLL), 2)
+        if abs(gap) >= 0.01:
+            state.setdefault("transactions", []).append({
+                "id": f"ledger-open-{today}", "ts": ts.now_iso(), "type": "adjustment", "amount": gap,
+                "reason": "opening reconciliation (z112): stored bankroll not backed by recorded trades"})
+            log(f"ledger: stored bankroll {before:,.2f} exceeds/trails the recorded trades by {gap:+,.2f} → recorded as one adjustment")
+        state["ledgerVersion"] = 1
+    state["bankroll"] = ts.ledger_bankroll(state, STARTING_BANKROLL)
+    if before is not None and abs((before or 0) - state["bankroll"]) >= 0.01:
+        log(f"bankroll re-derived from the journal: {before:,.2f} → {state['bankroll']:,.2f}")
+    sig_before = {t.get("id"): _sig(t) for t in trades_list(state)}
     if app_done:
         log(f"applied {len(app_done)} app action(s)")
 
@@ -2020,6 +2127,7 @@ def main():
 
     if ACTIONS_ONLY:
         # 15-minute pass: app actions + fresh marks, no new-trade scan.
+        finalize_state(state, sig_before)
         recompute(state, universe, today)
         if DRY_RUN:
             log("DRY RUN — not writing state.")
@@ -2078,18 +2186,19 @@ def main():
     if bond:
         log(f"bond trend (context, not scored): TLT {bond['trend']} · {bond['tlt']} vs MA20 {bond['ma20']} / MA50 {bond['ma50']} · "
             f"10d {bond['slope10Pct']:+.2f}% · stock/bond corr60 {bond['stockBondCorr60']}")
-    fed = None
+    # NB: `fed` is already the rate-expectation dict the scorer uses - this one is fed_ctx
+    fed_ctx = None
     try:
-        fed = fed_context()
+        fed_ctx = fed_context()
     except Exception as e:
         log(f"fed context failed: {e}")
-    if fed:
-        log(f"fed (context, not scored): {fed.get('stance')} · pace {fed.get('monthlyPaceBn')}bn/mo · net liquidity "
-            f"{fed.get('netLiquidityBn')}bn (13w {fed.get('netLiquidity13wBn')}) · statement tone {fed.get('statementTone')}"
-            f" (Δ {fed.get('toneChange')})")
+    if fed_ctx:
+        log(f"fed (context, not scored): {fed_ctx.get('stance')} · pace {fed_ctx.get('monthlyPaceBn')}bn/mo · net liquidity "
+            f"{fed_ctx.get('netLiquidityBn')}bn (13w {fed_ctx.get('netLiquidity13wBn')}) · statement tone {fed_ctx.get('statementTone')}"
+            f" (Δ {fed_ctx.get('toneChange')})")
     regime_ctx = {"regime": (rc or {}).get("regime"), "quad": (rc or {}).get("quadNowcast"),
                   "certainty": (rc or {}).get("certainty"), "dialedIn": not agnostic, "botMode": regime.get("mode"),
-                  "bondTrend": bond, "fed": fed}
+                  "bondTrend": bond, "fed": fed_ctx}
     # ex-post: mark every trade whose entry-day regime call has since been judged
     outcomes = regime_call_outcomes(rc)
     for t in trades_list(state):
@@ -2108,6 +2217,7 @@ def main():
     closed = manage_open_positions(state, universe, today, ctx)
     opened = open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad, opt_market, fed,
                              research=ctx["research"], patterns=ctx["patterns"], regime_ctx=regime_ctx)
+    finalize_state(state, sig_before)
     recompute(state, universe, today)
 
     log(f"summary: +{len(opened)} opened · {len(closed)} closed · "
