@@ -12,6 +12,8 @@ Env (repo secrets):
   SUPABASE_SERVICE_KEY  the service_role key
 """
 import json, os, sys, urllib.request, urllib.error
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import trade_sync as ts   # z112: shared merge rule (runner pull / this push / the app)
 from datetime import datetime, timezone
 
 # ---- Supabase credentials (same block in every Valuatio sync script) --------
@@ -123,10 +125,36 @@ def main():
     trades = trades or []
     now = datetime.now(timezone.utc).isoformat()
 
-    rows = []
+    # z112: never overwrite a NEWER version the app wrote. Read what Supabase has
+    # and upsert only trades where the repo's version wins under the shared rule
+    # (trade_sync.winner: closed beats open, more trims beat fewer, else later
+    # updatedAt) or that Supabase doesn't have yet.
+    remote = {}
+    off = 0
+    while True:
+        st, body = _req("GET", f"/rest/v1/{TABLE}?select=id,trade&order=id&limit=1000&offset={off}")
+        if st != 200:
+            print(f"::warning::could not read {TABLE} first (HTTP {st}) - pushing everything as before")
+            remote = None
+            break
+        page = json.loads(body or "[]")
+        for r in page:
+            if isinstance(r, dict) and isinstance(r.get("trade"), dict):
+                remote[r.get("id")] = r["trade"]
+        if len(page) < 1000:
+            break
+        off += 1000
+    rows, kept = [], 0
     for i, t in enumerate(trades):
         tid = t.get("id") or f"{t.get('ticker','TX')}-{t.get('entryDate','')}-{i}"
+        if remote is not None and tid in remote and ts.winner(t, remote[tid]) == "remote":
+            kept += 1                       # Supabase holds a newer version (the app's) - leave it
+            continue
+        if remote is not None and tid in remote and remote[tid] == t:
+            continue                        # identical - nothing to write
         rows.append({"id": tid, "trade": t, "updated_at": now})
+    if kept:
+        print(f"  kept {kept} newer app version(s) in Supabase (the next runner pull brings them into the repo)")
 
     sent, failed = 0, 0
     for i in range(0, len(rows), 100):
