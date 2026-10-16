@@ -1186,7 +1186,7 @@ def finalize_state(state, before):
     n = stamp_changes(state, before)
     derived = ts.ledger_bankroll(state, STARTING_BANKROLL)
     if abs((state.get("bankroll") or 0) - derived) >= 0.01:
-        log(f"bankroll check: running {state.get('bankroll'):,.2f} vs journal {derived:,.2f} → journal wins")
+        log(f"bankroll check: running {(state.get('bankroll') or 0):,.2f} vs journal {derived:,.2f} → journal wins")
     state["bankroll"] = derived
     if n:
         log(f"stamped updatedAt on {n} changed trade(s)")
@@ -1214,7 +1214,7 @@ def pull_supabase_trades(state):
         return {"error": str(e)}
     trades = trades_list(state)
     by_id = {t.get("id"): t for t in trades if t.get("id")}
-    added = updated = 0
+    added = updated = phantom = 0
     for row in rows:
         t = row.get("trade") if isinstance(row, dict) else None
         tid = (t or {}).get("id") or (row or {}).get("id")
@@ -1222,6 +1222,23 @@ def pull_supabase_trades(state):
             continue
         t["id"] = tid
         if tid not in by_id:
+            if t.get("status") == "void":
+                continue
+            # z116: a RUNNER-made trade the repo doesn't have comes from a run whose
+            # state was never saved (the commit bug fixed in z116). Those runs each
+            # restarted from the 2026-06-22 book, so their trades overlap and were
+            # sized off a stale bankroll - not imported (sync marks them void).
+            # RUNNER_RECOVER_SUPABASE=1 imports them, one per ticker not already open.
+            if ts.is_runner_id(tid):
+                if os.environ.get("RUNNER_RECOVER_SUPABASE") == "1" and t.get("status") == "open" and not any(
+                        x.get("ticker") == t.get("ticker") and x.get("status") == "open" for x in trades):
+                    t["_via"] = "supabase-recovered"
+                    trades.append(t)
+                    by_id[tid] = t
+                    added += 1
+                else:
+                    phantom += 1
+                continue
             t.setdefault("origin", "app")
             t["_via"] = "supabase"
             trades.append(t)
@@ -1237,8 +1254,9 @@ def pull_supabase_trades(state):
             loc["_via"] = "supabase"
             updated += 1
             log(f"  supabase → repo: updated {loc.get('ticker')} ({tid}) → {loc.get('status')}")
-    log(f"supabase pull: {len(rows)} row(s) · {added} new trade(s) stored · {updated} updated from the app")
-    return {"rows": len(rows), "added": added, "updated": updated}
+    log(f"supabase pull: {len(rows)} row(s) · {added} new trade(s) stored · {updated} updated from the app"
+        + (f" · {phantom} runner trade(s) from unsaved runs ignored (marked void by the mirror)" if phantom else ""))
+    return {"rows": len(rows), "added": added, "updated": updated, "phantom": phantom}
 
 
 def apply_app_actions(state, today):
