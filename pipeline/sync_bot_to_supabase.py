@@ -155,6 +155,18 @@ def main():
         rows.append({"id": tid, "trade": t, "updated_at": now})
     if kept:
         print(f"  kept {kept} newer app version(s) in Supabase (the next runner pull brings them into the repo)")
+    # z116: runner trades in Supabase that the repo journal doesn't have came from
+    # runs whose state was never committed - mark them void (kept for audit,
+    # ignored by the app and the ledger) instead of letting devices load them.
+    if remote:
+        repo_ids = {t.get("id") for t in trades}
+        for rid, rt in remote.items():
+            if rid not in repo_ids and ts.is_runner_id(rid) and rt.get("status") != "void":
+                v = dict(rt, status="void", voidReason="runner run never saved (z116 commit fix)", updatedAt=now)
+                rows.append({"id": rid, "trade": v, "updated_at": now})
+        nv = sum(1 for r in rows if r["trade"].get("status") == "void")
+        if nv:
+            print(f"  marking {nv} unsaved-run runner trade(s) void in Supabase")
 
     sent, failed = 0, 0
     for i in range(0, len(rows), 100):
