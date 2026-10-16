@@ -56,7 +56,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A data/bot_training_data.json data/app_actions/ 2>/dev/null || true
+          git add -A data/bot_training_data.json
+          git add -A data/app_actions 2>/dev/null || true     # z116: separate - the folder may not exist
           if git diff --staged --quiet; then echo "No state change"; exit 0; fi
           git commit -m "Bot: applied app actions $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           for i in 1 2 3 4 5; do
