@@ -27,6 +27,11 @@ def _ntrims(t):
 
 def winner(local, remote):
     """-> 'local' | 'remote' for two versions of the same trade id."""
+    # z116: 'void' (a trade from a runner run whose state was never saved) is final
+    if remote.get("status") == "void" and local.get("status") != "void":
+        return "remote"
+    if local.get("status") == "void":
+        return "local"
     lc, rc = local.get("status") == "closed", remote.get("status") == "closed"
     if rc and not lc:
         return "remote"
@@ -66,3 +71,8 @@ def ledger_bankroll(state, start):
     trims = sum(trim_total(t) for t in trades)
     closed = sum(exit_realized(t) for t in trades if t.get("status") == "closed")
     return round(start + capital + trims + closed, 2)
+
+
+def is_runner_id(tid):
+    """Runner-made trade ids look like TICKER-YYYY-MM-DD-runner-<epoch>."""
+    return "-runner-" in str(tid or "")
