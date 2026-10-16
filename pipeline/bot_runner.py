@@ -2052,19 +2052,82 @@ def _perf_by_regime_mode(closed, pl):
     }
 
 
+# ----------------------------- ledger (z117) -----------------------------------
+LEDGER_VERSION = 2
+# The z112 opening adjustment (ledgerVersion 1) compared the stored book's bankroll
+# with a ledger that already held LATER events pulled from Supabase (the 2026-10-04
+# closes, the 10-14 app trims), so it absorbed -$738.71 of real results. The stored
+# book's facts come from git history and are re-derived once, as of its own date.
+OPENING_FACTS = {
+    "ledger-open-2026-10-16": {
+        "storedBankroll": 110369.24, "asOfTs": "2026-06-22T23:14:39Z",
+        "source": "TRAPP2-BOT@d306933 data/bot_training_data.json (generatedAt 2026-06-22T23:14:39.141Z, 29 trades)"},
+}
+
+
+def fix_v1_opening(state):
+    for x in state.get("transactions") or []:
+        if x.get("type") != "adjustment" or x.get("asOf"):
+            continue
+        f = OPENING_FACTS.get(x.get("id"))
+        if not f:
+            log(f"ledger: {x.get('id')} has no stored-book date on record - left as is ({x.get('amount')})")
+            continue
+        asof = f["asOfTs"][:10]
+        new = round(f["storedBankroll"] - ts.ledger_asof(state, STARTING_BANKROLL, asof, exclude_ids={x.get("id")}), 2)
+        log(f"ledger: opening adjustment {x.get('id')} re-derived as of {asof}: "
+            f"{float(x.get('amount') or 0):+,.2f} -> {new:+,.2f}")
+        x.update({"correctedFrom": x.get("amount"), "recordedAt": x.get("ts"), "amount": new, "ts": f["asOfTs"],
+                  "asOf": asof, "storedBankroll": f["storedBankroll"], "source": f["source"],
+                  "reason": "opening reconciliation: the 2026-06-22 book's bankroll not backed by trades realized "
+                            "through that date (z117 re-derived; z112 had compared it with later events)"})
+
+
+def reconcile_ledger(state, before, today):
+    """z117 - one journal ledger, honest about time. Returns repaired trade ids.
+    1. pnl that contradicts a closed trade's own prices is repaired (trade_sync.repair_pnl).
+    2. A pre-ledger book (no ledgerVersion): its stored bankroll is dated (generatedAt);
+       the gap vs what had been realized BY THAT DATE becomes ONE dated adjustment.
+       Events after the date (e.g. a later close pulled from Supabase) keep moving the
+       bankroll - they are never absorbed into the gap.
+    3. A ledgerVersion-1 book (z112's undated adjustment) is re-derived once."""
+    fixed = ts.repair_pnl(trades_list(state))
+    for tid, was, now in fixed:
+        log(f"ledger: pnl repaired {tid}: {was:+,.2f} -> {now:+,.2f} (entry/exit/shares and realizedPL agree)")
+    ver = state.get("ledgerVersion") or 0
+    if ver < 1:
+        asof_ts = str(state.get("generatedAt") or "") or ts.now_iso()
+        stored = before if isinstance(before, (int, float)) else STARTING_BANKROLL
+        gap = round(stored - ts.ledger_asof(state, STARTING_BANKROLL, asof_ts[:10]), 2)
+        if abs(gap) >= 0.01:
+            state.setdefault("transactions", []).append({
+                "id": f"ledger-open-{today}", "ts": asof_ts, "recordedAt": ts.now_iso(), "type": "adjustment",
+                "amount": gap, "asOf": asof_ts[:10], "storedBankroll": stored,
+                "reason": "opening reconciliation: stored bankroll not backed by trades realized through its own date"})
+            log(f"ledger: stored bankroll {stored:,.2f} (as of {asof_ts[:10]}) vs trades realized by then -> "
+                f"{gap:+,.2f} recorded as one dated adjustment")
+    elif ver == 1:
+        fix_v1_opening(state)
+    state["ledgerVersion"] = LEDGER_VERSION
+    return fixed
+
+
 def recompute(state, universe, today):
     bets = trades_list(state)
     closed = [b for b in bets if b.get("status") == "closed"]
     open_b = [b for b in bets if b.get("status") == "open"]
 
     def _pl(b):
-        v = b.get("realizedPL")
-        return v if isinstance(v, (int, float)) else (b.get("pnl") or 0)
+        # z117: what the trade put into the bankroll - exit P/L + its trims, the
+        # number the ledger sums. realizedPL alone left out trims (a full exit by
+        # partial sells read as a $0 loss) and disagreed with pnl on 21 trades.
+        return round(ts.exit_realized(b) + ts.trim_total(b), 2)
 
     wins = [b for b in closed if _pl(b) > 0]
-    losses = [b for b in closed if _pl(b) <= 0]
+    losses = [b for b in closed if _pl(b) < 0]
+    flat = len(closed) - len(wins) - len(losses)      # opened and sold at the same price
     total_pnl = round(sum(_pl(b) for b in closed), 2)
-    win_rate = round(len(wins) / len(closed), 3) if closed else None
+    win_rate = round(len(wins) / (len(wins) + len(losses)), 3) if (wins or losses) else None
     avg_win = round(sum(_pl(b) for b in wins) / len(wins), 2) if wins else None
     avg_loss = round(sum(_pl(b) for b in losses) / len(losses), 2) if losses else None
     pf = (round(abs((avg_win * len(wins)) / (avg_loss * len(losses))), 2)
@@ -2075,12 +2138,17 @@ def recompute(state, universe, today):
     book = round(state.get("bankroll", STARTING_BANKROLL) + open_pnl, 2)
 
     state["counts"] = {"total": len(bets), "open": len(open_b), "closed": len(closed),
-                       "wins": len(wins), "losses": len(losses)}
+                       "wins": len(wins), "losses": len(losses), "flat": flat}
     state["performance"] = {"winRate": win_rate, "totalPnl": total_pnl,
                             "avgWin": avg_win, "avgLoss": avg_loss, "profitFactor": pf,
                             "byRegimeMode": _perf_by_regime_mode(closed, _pl)}
-    state["allTimeReturnPct"] = round((state.get("bankroll", STARTING_BANKROLL) - STARTING_BANKROLL)
-                                      / STARTING_BANKROLL * 100, 2)
+    # z117: capital in / out and the dated opening adjustment are the BASE, not
+    # performance - money the trade record can't explain is not a return.
+    flows = sum(float(x.get("amount") or 0) for x in (state.get("transactions") or [])
+                if x.get("type") in ts.CAPITAL_TYPES)
+    base = STARTING_BANKROLL + flows
+    state["allTimeReturnPct"] = (round((state.get("bankroll", STARTING_BANKROLL) - base) / base * 100, 2)
+                                 if base > 0 else None)
     state["openPositions"] = [{"ticker": b["ticker"], "direction": b.get("direction"),
                                "instrument": b.get("instrument"), "entryDate": b.get("entryDate"),
                                "entryPrice": b.get("entryPrice"), "conviction": b.get("conviction")}
@@ -2123,14 +2191,7 @@ def main():
     # gap is written down as ONE explicit adjustment (never silently dropped), so
     # the balance carries over and the ledger says where it came from.
     before = state.get("bankroll")
-    if not state.get("ledgerVersion"):
-        gap = round((before or STARTING_BANKROLL) - ts.ledger_bankroll(state, STARTING_BANKROLL), 2)
-        if abs(gap) >= 0.01:
-            state.setdefault("transactions", []).append({
-                "id": f"ledger-open-{today}", "ts": ts.now_iso(), "type": "adjustment", "amount": gap,
-                "reason": "opening reconciliation (z112): stored bankroll not backed by recorded trades"})
-            log(f"ledger: stored bankroll {before:,.2f} exceeds/trails the recorded trades by {gap:+,.2f} → recorded as one adjustment")
-        state["ledgerVersion"] = 1
+    reconcile_ledger(state, before, today)       # z117: pnl repair + dated opening adjustment
     state["bankroll"] = ts.ledger_bankroll(state, STARTING_BANKROLL)
     if before is not None and abs((before or 0) - state["bankroll"]) >= 0.01:
         log(f"bankroll re-derived from the journal: {before:,.2f} → {state['bankroll']:,.2f}")
