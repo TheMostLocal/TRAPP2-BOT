@@ -23,6 +23,15 @@ jobs:
     timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
+
+      - name: Start from the latest main (z117)
+        # A queued run checks out the commit it was TRIGGERED on and can wait a long
+        # time in its concurrency group. Committing from that stale tree and then
+        # merging "ours" overwrites newer work (2026-10-16: intraday tape points lost).
+        run: |
+          git fetch -q origin "${{ github.ref_name }}" && { git merge -q --ff-only FETCH_HEAD || git reset -q --hard FETCH_HEAD; }
+          echo "at $(git rev-parse --short HEAD)"
+
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
       - name: Value the book
