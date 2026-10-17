@@ -70,9 +70,24 @@ def exit_realized(t):
     return pnl
 
 
+def trim_events(t):
+    """z118 - every trim exactly once: the runner's trims[] plus the app's
+    partialSells[] the runner never mirrored. A partial sell the runner applied
+    from an app trim action sits in trims[] with origin app, the same date and
+    the same realized, so it isn't counted twice; one it never saw (an adopted
+    trade's device-side history) still counts. z100 took trims[] wholesale when
+    present, which drops those the first time the runner trims. Same rule as
+    app.js _betTrimEvents."""
+    tr = [x for x in (t.get("trims") or []) if isinstance(x, dict)]
+
+    def mirrored(p):
+        return any(x.get("origin") == "app" and str(x.get("date") or "")[:10] == str(p.get("date") or "")[:10]
+                   and abs(float(x.get("realized") or 0) - float(p.get("realized") or 0)) <= PNL_TOL for x in tr)
+    return tr + [p for p in (t.get("partialSells") or []) if isinstance(p, dict) and not mirrored(p)]
+
+
 def trim_total(t):
-    tr = t.get("trims") or t.get("partialSells") or []
-    return sum(float((x or {}).get("realized") or 0) for x in tr)
+    return sum(float(x.get("realized") or 0) for x in trim_events(t))
 
 
 def ledger_bankroll(state, start):
@@ -97,8 +112,8 @@ def ledger_asof(state, start, asof, exclude_ids=()):
               and str(x.get("ts") or "")[:10] <= d)
     real = 0.0
     for t in state.get("trades") or []:
-        for x in (t.get("trims") or t.get("partialSells") or []):
-            if (x or {}).get("date") and str(x["date"])[:10] <= d:
+        for x in trim_events(t):
+            if x.get("date") and str(x["date"])[:10] <= d:
                 real += float(x.get("realized") or 0)
         if t.get("status") == "closed" and t.get("exitDate") and str(t["exitDate"])[:10] <= d:
             real += exit_realized(t)
