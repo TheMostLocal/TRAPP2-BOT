@@ -1303,7 +1303,9 @@ def apply_app_actions(state, today):
                 t = by_id.get(a.get("tradeId"))
                 px = _f(a.get("price"))
                 if not t or t.get("status") != "open" or not px:
-                    note = f"{kind} skipped (trade not open here or no price)"
+                    note = (f"{kind} skipped: {a.get('tradeId')} is not in the journal (z118: the app holds these "
+                            f"and sends the whole trade instead - 'adopt')" if not t
+                            else f"{kind} skipped (trade not open here or no price)")
                 elif kind == "trim":
                     sh = _f(a.get("shares")) or 0
                     cur = _f(t.get("shares")) or 0
@@ -1329,6 +1331,32 @@ def apply_app_actions(state, today):
                     t["won"] = total > 0
                     state["bankroll"] = round(state.get("bankroll", STARTING_BANKROLL) + r, 2)
                     note = f"closed {t['ticker']} @ {px} → {total:+.2f}"
+            elif kind == "adopt":
+                # z118: a trade the app holds that this journal never had (opened on a
+                # device before the outbox existed, or missed by it). The snapshot is
+                # the device's CURRENT version - its trims / close included - so it is
+                # stored as is, never re-applied. One the journal already has merges by
+                # the shared winner rule, exactly like a Supabase pull.
+                t = dict(a.get("trade") or {})
+                tid = t.get("id")
+                if not tid or not t.get("ticker") or ts.is_runner_id(tid) or t.get("status") == "void":
+                    note = "adopt skipped (no id / ticker, runner id or void)"
+                elif tid not in by_id:
+                    t["origin"] = t.get("origin") or "app"
+                    t["_via"] = "app-adopt"
+                    t["updatedAt"] = t.get("updatedAt") or a.get("ts") or ts.now_iso()
+                    trades.append(t)
+                    by_id[tid] = t
+                    note = f"adopted {t.get('status', 'open')} {t.get('direction', 'long')} {t['ticker']} ({tid})"
+                elif ts.winner(by_id[tid], t) == "remote":
+                    loc = by_id[tid]
+                    for k in ts.STATUS_FIELDS:
+                        if k in t:
+                            loc[k] = t[k]
+                    loc["_via"] = "app-adopt"
+                    note = f"adopt: the app's version of {loc.get('ticker')} ({tid}) wins -> {loc.get('status')}"
+                else:
+                    note = f"adopt: the journal already has {tid} (journal version kept)"
             elif kind in ("deposit", "withdrawal"):
                 amt = _f(a.get("amount")) or 0
                 state["bankroll"] = round(state.get("bankroll", STARTING_BANKROLL) + amt, 2)
