@@ -49,6 +49,7 @@ import json
 import math
 import os
 import trade_sync as ts
+import market_hours as mh   # z121: the NYSE regular session (ET) - the only time the bot trades
 import sys
 import urllib.request
 import urllib.error
@@ -315,7 +316,7 @@ def load_universe():
             t = (r.get("ticker") or r.get("symbol") or "").upper()
             if not t or t in rows:
                 continue
-            price = None
+            price, fld = None, None
             for fld in ("price", "close", "closeyest"):   # last close when there's no live quote
                 v = _f(r.get(fld))
                 if v is not None and math.isfinite(v) and v > 0:
@@ -331,6 +332,7 @@ def load_universe():
             rows[t] = {
                 "ticker": t, "price": round(price * f, 6),
                 "priceLocal": price, "currency": ccy, "fxRate": f, "scan": scan,
+                "asOf": r.get("fetched_at") if fld == "price" else None,   # z121: a close is never a live quote
                 "assetClass": r.get("asset_class"),
                 "sector": r.get("sector") or "Unknown",
                 "name": r.get("name") or t,
@@ -1152,6 +1154,40 @@ def pattern_signal(tk, pats):
 APP_ACTIONS_DIR = ROOT / "data" / "app_actions"
 ACTIONS_ONLY = ("--actions-only" in sys.argv) or os.environ.get("RUNNER_ACTIONS_ONLY") == "1"
 
+# ---- z121: ONE trader (this runner), trading ONLY in the NYSE regular session ----
+# The app no longer opens, closes or trims anything: its Run button asks this runner
+# to run, and a close / trim from a device is a REQUEST executed here, in session, at
+# this runner's own fresh quote. RUNNER_APP_TRADES=1 restores the z100-z118 behaviour.
+RUNNER_ONLY = os.environ.get("RUNNER_APP_TRADES", "").strip().lower() not in ("1", "true", "yes")
+FORCE_SESSION = os.environ.get("RUNNER_FORCE_SESSION", "").strip() == "1"          # tests only
+MAX_QUOTE_AGE_MIN = float(os.environ.get("RUNNER_MAX_QUOTE_AGE_MIN") or 30)       # a trade needs a quote this fresh
+ENTRY_STOP_BEFORE_CLOSE_MIN = int(os.environ.get("RUNNER_ENTRY_STOP_BEFORE_CLOSE_MIN") or 30)
+
+
+def _hhmm(s, default):
+    try:
+        h, m = str(s).strip().split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        return default
+
+
+ENTRY_AFTER_MIN = _hhmm(os.environ.get("RUNNER_ENTRY_AFTER_ET") or "10:00", 600)   # after the opening auction settles
+
+
+def _now_override():
+    s = (os.environ.get("RUNNER_NOW_UTC") or "").strip()                               # tests only
+    if not s:
+        return None
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+NOW_UTC = _now_override()
+
 
 # ----------------------------- Supabase pull (z112) ----------------------------
 # The app writes bot trades straight to Supabase (bot_trades, anon key) - that
@@ -1259,7 +1295,7 @@ def pull_supabase_trades(state):
     return {"rows": len(rows), "added": added, "updated": updated, "phantom": phantom}
 
 
-def apply_app_actions(state, today):
+def apply_app_actions(state, today, session=None, fresh=None):
     if not APP_ACTIONS_DIR.exists():
         return []
     files = sorted(APP_ACTIONS_DIR.glob("*.json"))
@@ -1278,15 +1314,20 @@ def apply_app_actions(state, today):
     seen = {x.get("id") for x in applied}
     trades = trades_list(state)
     by_id = {t.get("id"): t for t in trades if t.get("id")}
-    done = []
+    done, deferred = [], 0
     for a in actions:
         aid, kind = a.get("id"), a.get("type")
         if not aid or aid in seen:
             a["_file"].unlink(missing_ok=True)
             continue
         note = ""
+        if kind in ("close", "trim") and not session:
+            deferred += 1                   # z121: a close / trim waits for the NYSE session (file left in place)
+            continue
         try:
-            if kind == "open":
+            if kind == "open" and RUNNER_ONLY:
+                note = "open rejected: runner-only trading (z121) - only the runner opens trades"
+            elif kind == "open":
                 t = dict(a.get("trade") or {})
                 if t.get("id") and t["id"] not in by_id and t.get("ticker") and _f(t.get("entryPrice")):
                     t.setdefault("status", "open")
@@ -1301,7 +1342,14 @@ def apply_app_actions(state, today):
                     note = "open skipped (exists or incomplete)"
             elif kind in ("close", "trim"):
                 t = by_id.get(a.get("tradeId"))
-                px = _f(a.get("price"))
+                req_px = px = _f(a.get("price"))
+                if RUNNER_ONLY and t is not None:
+                    # z121: a request, executed at this runner's own fresh quote - never the device's price
+                    u = (fresh or {}).get((t.get("ticker") or "").upper())
+                    px = _f(u.get("price")) if u else None
+                    if t.get("status") == "open" and not px:
+                        deferred += 1               # no fresh quote this pass - the next pass tries again
+                        continue
                 if not t or t.get("status") != "open" or not px:
                     note = (f"{kind} skipped: {a.get('tradeId')} is not in the journal (z118: the app holds these "
                             f"and sends the whole trade instead - 'adopt')" if not t
@@ -1315,8 +1363,10 @@ def apply_app_actions(state, today):
                         realized = round(d * (px - entry) * sh, 2)
                         t["shares"] = round(cur - sh, 6)
                         t["notional"] = round(t["shares"] * entry, 2)
-                        t.setdefault("trims", []).append({"date": a.get("date") or today, "shares": sh, "price": px,
-                                                          "realized": realized, "origin": "app"})
+                        t.setdefault("trims", []).append({"date": today if RUNNER_ONLY else (a.get("date") or today),
+                                                          "shares": sh, "price": px, "realized": realized, "origin": "app",
+                                                          "requestedPrice": req_px,
+                                                          "at": (NOW_UTC or datetime.now(timezone.utc)).isoformat(timespec="seconds")})
                         t["realizedTrim"] = round((t.get("realizedTrim") or 0) + realized, 2)
                         state["bankroll"] = round(state.get("bankroll", STARTING_BANKROLL) + realized, 2)
                         note = f"trimmed {t['ticker']} {sh} @ {px} → {realized:+.2f}"
@@ -1324,8 +1374,9 @@ def apply_app_actions(state, today):
                         note = "trim skipped (shares out of range)"
                 else:
                     r = realized_pnl(t, px)
-                    t.update(status="closed", exitDate=a.get("date") or today, exitPrice=px,
-                             exitReason=a.get("reason") or "app-manual")
+                    t.update(status="closed", exitDate=today if RUNNER_ONLY else (a.get("date") or today), exitPrice=px,
+                             exitReason=a.get("reason") or "app-manual", exitRequestedPrice=req_px,
+                             exitAt=(NOW_UTC or datetime.now(timezone.utc)).isoformat(timespec="seconds"))
                     total = round(r + (t.get("realizedTrim") or 0), 2)
                     t["realizedPL"] = t["pnl"] = total
                     t["won"] = total > 0
@@ -1375,6 +1426,8 @@ def apply_app_actions(state, today):
         log(f"  app action {aid} ({kind}): {note}")
         if not DRY_RUN:
             a["_file"].unlink(missing_ok=True)
+    if deferred:
+        log(f"  {deferred} close/trim request(s) wait for the NYSE session or a fresh quote (left in the inbox)")
     state["appliedActions"] = applied[-2000:]
     return done
 
@@ -2200,8 +2253,83 @@ def recompute(state, universe, today):
 
 
 # ----------------------------- main -------------------------------------------
+# ----------------------------- session gate (z121) ------------------------------
+_AMERICAS = (".TO", ".V", ".NE", ".CN", ".MX", ".SA", ".BA")
+
+
+def session_tradable(ticker):
+    """Can a NEW position in this ticker be opened at a live price during the NYSE
+    session? US listings, Americas exchanges, crypto (-USD) and futures (=F): yes.
+    Asian / European listings: their home market is shut (or closing) during the
+    NYSE session, so their "price" is an old close - no entries."""
+    t = (ticker or "").upper()
+    if not t or t.startswith("^") or t.endswith("=X"):
+        return False
+    if t.endswith("-USD") or t.endswith("=F"):
+        return True
+    return "." not in t or t.endswith(_AMERICAS)
+
+
+def _age_min(asof, now):
+    try:
+        d = datetime.fromisoformat(str(asof).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return (now - d).total_seconds() / 60.0
+
+
+def fresh_universe(universe, now):
+    """Only rows whose live quote is at most MAX_QUOTE_AGE_MIN old trade this pass."""
+    out = {}
+    for t, u in universe.items():
+        a = _age_min(u.get("asOf"), now)
+        if a is not None and -5 <= a <= MAX_QUOTE_AGE_MIN:
+            out[t] = u
+    return out
+
+
+def entry_window(sess, state):
+    last = state.get("lastEntryScan") or {}
+    if last.get("date") == sess["date"]:
+        return False, (f"today's entry scan already ran ({str(last.get('et', ''))[11:16]} ET) - one scan per "
+                       f"session; exits and requests still run every pass")
+    if FORCE_SESSION and not sess["open"]:
+        return True, "forced (test)"
+    if sess["minute"] < ENTRY_AFTER_MIN:
+        return False, f"before {ENTRY_AFTER_MIN // 60:02d}:{ENTRY_AFTER_MIN % 60:02d} ET - entries wait for the opening auction to settle"
+    if sess.get("closeMin") is not None and sess["minute"] >= sess["closeMin"] - ENTRY_STOP_BEFORE_CLOSE_MIN:
+        return False, f"within {ENTRY_STOP_BEFORE_CLOSE_MIN} min of the close - no new entries"
+    return True, ""
+
+
+def stamp_execution(state, ids_before, open_before, sess, universe, now_utc):
+    """Every fill gets its UTC time and quote time, so "only in session" is auditable."""
+    now = now_utc.isoformat(timespec="seconds")
+    for t in trades_list(state):
+        tid, tk = t.get("id"), (t.get("ticker") or "").upper()
+        u = universe.get(tk) or {}
+        if tid not in ids_before and not t.get("entryAt"):
+            t.update(entryAt=now, entryQuoteAt=u.get("asOf"), entrySession=sess.get("label"))
+        if tid in open_before and t.get("status") == "closed" and not t.get("exitAt"):
+            t.update(exitAt=now, exitQuoteAt=u.get("asOf"))
+            if not session_tradable(tk):
+                t["exitPriceBasis"] = "last available price (home market not in the NYSE session)"
+
+
+def _write_state(state, msg):
+    if DRY_RUN:
+        log(f"DRY RUN - not writing state ({msg}).")
+        return
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, separators=(",", ":")))
+    log(f"{msg} · wrote {STATE_FILE}")
+
+
 def main():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    now_utc = NOW_UTC or datetime.now(timezone.utc)
+    today = now_utc.strftime("%Y-%m-%d")
     log(f"=== run {today} · dry_run={DRY_RUN} ===")
     log(f"limits: maxNew={MAX_NEW_TRADES} maxPos={MAX_POSITIONS} sizePct={POSITION_PCT*100:.0f} "
         f"reservePct={CASH_RESERVE_PCT*100:.0f} minScore={MIN_SCORE}")
@@ -2211,13 +2339,22 @@ def main():
         f"{sum(1 for b in trades_list(state) if b.get('status')=='open')} open · "
         f"{len(trades_list(state))} total trades")
 
-    # trades the app wrote to Supabase first (z112), then the GitHub inbox (z100)
-    sb_pull = pull_supabase_trades(state)
-    app_done = apply_app_actions(state, today)
-    # bankroll derived from the journal - the same rule the app uses (z112).
-    # First time only: if the stored bankroll isn't backed by recorded trades, the
-    # gap is written down as ONE explicit adjustment (never silently dropped), so
-    # the balance carries over and the ledger says where it came from.
+    sess = mh.session_now(now_utc)
+    in_session = bool(sess["open"]) or FORCE_SESSION
+    log(f"market: {sess['text']}" + (" · RUNNER_FORCE_SESSION=1 (test): treated as open" if FORCE_SESSION and not sess["open"] else ""))
+    universe = load_universe()
+    if not universe:
+        log("✗ no universe data — aborting (won't write empty state)")
+        sys.exit(1)
+    fresh = fresh_universe(universe, now_utc) if in_session else {}
+    if in_session:
+        log(f"quotes: {len(fresh)}/{len(universe)} fresh (≤ {MAX_QUOTE_AGE_MIN:.0f} min old) - only these can trade this pass")
+    # z121: the app no longer trades, so Supabase is this journal's mirror, not an input
+    if RUNNER_ONLY:
+        log("runner-only (z121): only this runner trades; Supabase mirrors the journal and is not read back")
+    else:
+        pull_supabase_trades(state)
+    app_done = apply_app_actions(state, today, sess if in_session else None, fresh)
     before = state.get("bankroll")
     reconcile_ledger(state, before, today)       # z117: pnl repair + dated opening adjustment
     state["bankroll"] = ts.ledger_bankroll(state, STARTING_BANKROLL)
@@ -2227,21 +2364,23 @@ def main():
     if app_done:
         log(f"applied {len(app_done)} app action(s)")
 
-    universe = load_universe()
-    if not universe:
-        log("✗ no universe data — aborting (won't write empty state)")
-        sys.exit(1)
-
-    if ACTIONS_ONLY:
-        # 15-minute pass: app actions + fresh marks, no new-trade scan.
+    if not in_session:
+        # z121: nothing trades outside the NYSE regular session - nights, weekends, holidays,
+        # after a 1 pm early close. Bookkeeping still applies (adopting a device's trades,
+        # cash in / out); close / trim requests wait in the inbox for the session.
+        if not app_done:
+            log("market closed - no trades; journal unchanged (nothing written)")
+            return
         finalize_state(state, sig_before)
         recompute(state, universe, today)
-        if DRY_RUN:
-            log("DRY RUN — not writing state.")
-            return
-        STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        STATE_FILE.write_text(json.dumps(state, separators=(",", ":")))
-        log(f"actions-only pass: {len(app_done)} applied · bankroll ${state['bankroll']:,.2f} · wrote {STATE_FILE}")
+        _write_state(state, f"closed-market pass: {len(app_done)} bookkeeping action(s), no trades")
+        return
+
+    if ACTIONS_ONLY:
+        # 15-minute pass: requests at fresh quotes + marks, no new-trade scan.
+        finalize_state(state, sig_before)
+        recompute(state, universe, today)
+        _write_state(state, f"actions-only pass: {len(app_done)} applied · bankroll ${state['bankroll']:,.2f}")
         return
 
     # Macro + cross-sectional context (faithful peer-grade + regime signals).
@@ -2321,9 +2460,24 @@ def main():
     ctx["research"] = alt_research.ResearchData(fetch_json, RAW, universe, today)
     ctx["patterns"] = load_patterns(use_regime=not agnostic)
     ctx["regime_agnostic"] = agnostic
-    closed = manage_open_positions(state, universe, today, ctx)
-    opened = open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad, opt_market, fed,
-                             research=ctx["research"], patterns=ctx["patterns"], regime_ctx=regime_ctx)
+    ids_before = {t.get("id") for t in trades_list(state)}
+    open_before = {t.get("id") for t in trades_list(state) if t.get("status") == "open"}
+    # z121: exits only at fresh quotes (a stale one is not managed this pass, never filled at an old price)
+    closed = manage_open_positions(state, fresh, today, ctx)
+    ok_entry, why = entry_window(sess, state)
+    eligible = {t: u for t, u in fresh.items() if session_tradable(t)} if ok_entry else {}
+    if ok_entry and eligible:
+        log(f"entries: {len(eligible)} tickers with a fresh quote whose home market is open now")
+        opened = open_new_trades(state, eligible, today, regime, grades, peer_ranks, xa, quad, opt_market, fed,
+                                 research=ctx["research"], patterns=ctx["patterns"], regime_ctx=regime_ctx)
+        state["lastEntryScan"] = {"date": sess["date"], "et": sess["et"], "opened": len(opened)}
+    elif ok_entry:
+        opened = []
+        log("entries: no fresh, session-tradable quotes yet - the next pass scans (today's scan not used up)")
+    else:
+        opened = []
+        log(f"entries: {why}")
+    stamp_execution(state, ids_before, open_before, sess, universe, now_utc)
     finalize_state(state, sig_before)
     recompute(state, universe, today)
 
