@@ -1,0 +1,36 @@
+{
+ "id": "open-mv8mti63-uzny6",
+ "ts": "2026-10-14T21:38:40.059Z",
+ "type": "open",
+ "trade": {
+  "id": "OXY-2026-10-14-1792013920056-5",
+  "ticker": "OXY",
+  "direction": "long",
+  "instrument": "shares",
+  "entryPrice": 61.41,
+  "shares": 497.924,
+  "notional": 30577.51,
+  "entryDate": "2026-10-14",
+  "conviction": 0.435,
+  "confidence": 0.435,
+  "horizonDays": 17,
+  "stopPrice": 50.66,
+  "targetPrice": 82.9,
+  "components": {
+   "fundamentals": 0.369,
+   "researchGrade": 0.395,
+   "health": 0.31,
+   "trend": 0.006,
+   "momentum": 0.615,
+   "meanReversion": -0.477,
+   "crossAsset": 0.191,
+   "peerGrade": 0.882,
+   "regimeGrade": 0.28,
+   "momentumGrade": -0.28,
+   "supplyChain": 0,
+   "institutional": 0.162,
+   "earningsRecency": 0.15
+  },
+  "origin": "app"
+ }
+}
