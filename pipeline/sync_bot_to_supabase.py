@@ -21,6 +21,10 @@ from datetime import datetime, timezone
 # role=service_role, or a new sb_secret_ key), so a wrong value in ONE of the
 # two secret names can't silently downgrade writes to anon. Never prints keys.
 import base64 as _sb_b64, json as _sb_json, os as _sb_os, re as _sb_re
+# z121: the runner is the only trader - Supabase mirrors the journal exactly (the
+# repo version always wins; rows the journal doesn't have are marked void).
+# RUNNER_APP_TRADES=1 restores the z112 two-way merge.
+RUNNER_ONLY = os.environ.get("RUNNER_APP_TRADES", "").strip().lower() not in ("1", "true", "yes")
 def _sb_claims(k):
     try:
         seg = k.split(".")[1]; seg += "=" * (-len(seg) % 4)
@@ -147,7 +151,7 @@ def main():
     rows, kept = [], 0
     for i, t in enumerate(trades):
         tid = t.get("id") or f"{t.get('ticker','TX')}-{t.get('entryDate','')}-{i}"
-        if remote is not None and tid in remote and ts.winner(t, remote[tid]) == "remote":
+        if not RUNNER_ONLY and remote is not None and tid in remote and ts.winner(t, remote[tid]) == "remote":
             kept += 1                       # Supabase holds a newer version (the app's) - leave it
             continue
         if remote is not None and tid in remote and remote[tid] == t:
@@ -161,8 +165,10 @@ def main():
     if remote:
         repo_ids = {t.get("id") for t in trades}
         for rid, rt in remote.items():
-            if rid not in repo_ids and ts.is_runner_id(rid) and rt.get("status") != "void":
-                v = dict(rt, status="void", voidReason="runner run never saved (z116 commit fix)", updatedAt=now)
+            if rid not in repo_ids and (RUNNER_ONLY or ts.is_runner_id(rid)) and rt.get("status") != "void":
+                v = dict(rt, status="void", updatedAt=now,
+                         voidReason=("runner run never saved (z116 commit fix)" if ts.is_runner_id(rid)
+                                     else "not in the runner's journal (runner-only trading, z121)"))
                 rows.append({"id": rid, "trade": v, "updated_at": now})
         nv = sum(1 for r in rows if r["trade"].get("status") == "void")
         if nv:
