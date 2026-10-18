@@ -1321,6 +1321,16 @@ def apply_app_actions(state, today, session=None, fresh=None):
             a["_file"].unlink(missing_ok=True)
             continue
         note = ""
+        if kind in ("open", "close", "trim") and RUNNER_ONLY:
+            # z122: the bot is autonomous - a device can't open, close or trim anything
+            note = f"{kind} rejected: the bot is autonomous (z122) - only the runner trades"
+            applied.append({"id": aid, "type": kind, "appliedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "note": note})
+            seen.add(aid)
+            done.append(note)
+            log(f"  app action {aid} ({kind}): {note}")
+            if not DRY_RUN:
+                a["_file"].unlink(missing_ok=True)
+            continue
         if kind in ("close", "trim") and not session:
             deferred += 1                   # z121: a close / trim waits for the NYSE session (file left in place)
             continue
