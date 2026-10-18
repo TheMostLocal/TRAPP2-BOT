@@ -1,0 +1,39 @@
+{
+ "id": "open-mv8mti63-kmqkg",
+ "ts": "2026-10-14T21:38:40.059Z",
+ "type": "open",
+ "trade": {
+  "id": "PARA-2026-10-14-1792013920055-1",
+  "ticker": "PARA",
+  "direction": "short",
+  "instrument": "shares",
+  "entryPrice": 0.54,
+  "shares": 18774.5084,
+  "notional": 10138.23,
+  "entryDate": "2026-10-14",
+  "conviction": -0.593,
+  "confidence": 0.493,
+  "horizonDays": 7,
+  "stopPrice": 0.68,
+  "targetPrice": 0.27,
+  "components": {
+   "fundamentals": -0.334,
+   "researchGrade": -0.507,
+   "health": -0.355,
+   "trend": -0.893,
+   "momentum": -0.96,
+   "meanReversion": 0.322,
+   "crossAsset": -0.512,
+   "peerGrade": -0.316,
+   "regimeGrade": 0.28,
+   "momentumGrade": -0.44,
+   "trendEngine": -0.878,
+   "peerRelativeStrength": -1,
+   "fed": 0.102,
+   "supplyChain": -0.001,
+   "institutional": 0,
+   "earningsRecency": 0.15
+  },
+  "origin": "app"
+ }
+}
