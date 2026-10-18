@@ -1,0 +1,37 @@
+{
+ "id": "open-mv8mti63-ig0i6",
+ "ts": "2026-10-14T21:38:40.059Z",
+ "type": "open",
+ "trade": {
+  "id": "TSM-2026-10-14-1792013920055-2",
+  "ticker": "TSM",
+  "direction": "long",
+  "instrument": "shares",
+  "entryPrice": 430,
+  "shares": 43.8166,
+  "notional": 18841.16,
+  "entryDate": "2026-10-14",
+  "conviction": 0.468,
+  "confidence": 0.468,
+  "horizonDays": 17,
+  "stopPrice": 354.75,
+  "targetPrice": 580.5,
+  "components": {
+   "fundamentals": 0.505,
+   "researchGrade": 0.592,
+   "health": 0.43,
+   "trend": 0.093,
+   "momentum": 0.268,
+   "meanReversion": 0.145,
+   "crossAsset": -0.512,
+   "peerGrade": 0.88,
+   "regimeGrade": 0.28,
+   "momentumGrade": 0.1,
+   "fed": 0.102,
+   "supplyChain": 0.002,
+   "institutional": -0.1,
+   "earningsRecency": 0.15
+  },
+  "origin": "app"
+ }
+}
