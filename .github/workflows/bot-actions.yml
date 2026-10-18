@@ -10,7 +10,7 @@ name: Bot · apply app actions + Supabase sync (every 15 min)
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/15 13-20 * * 1-5'
+    - cron: '*/15 13-21 * * 1-5'     # z121: the script itself trades only in session (EDT or EST)
 
 # Same group as bot-runner.yml: the two never write the state file at once.
 concurrency:
