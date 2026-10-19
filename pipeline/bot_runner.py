@@ -1020,6 +1020,57 @@ def fed_context():
             "asOf": m.get("generatedAt")}
 
 
+def curve_context(now=None):
+    """z126: the Treasury curve on the trade date - recorded as CONTEXT, never scored (the
+    rule for the bond trend and the Fed): 2s10s, 3m10y, 10y real (DGS10 - T10YIE, FRED's own
+    definition of the breakeven), 10y / 5y breakeven, the 5y5y forward, and last month's move
+    in the textbook 2Y / 10Y reading (bull / bear steepener / flattener, twist, parallel;
+    within +-3 bp = little changed) - the same rule as the app's Data -> Yield curve."""
+    base = f"{RAW}/TRAPP2-1/main/data/macro/"
+
+    def series(sid):
+        d = fetch_json(base + sid + ".json", timeout=20)
+        out = {}
+        for o in ((d or {}).get("observations") or []):
+            try:
+                if o.get("date") and o.get("value") not in (None, "", "."):
+                    out[o["date"]] = float(o["value"])
+            except (TypeError, ValueError):
+                pass
+        return out
+    s = {k: series(k) for k in ("DGS3MO", "DGS2", "DGS10", "T10YIE", "T5YIE", "T5YIFR")}
+    dates = sorted(set(s["DGS2"]) & set(s["DGS10"]))
+    if len(dates) < 30:
+        return None
+    d = dates[-1]
+    y, m, day = int(d[:4]), int(d[5:7]) - 1, int(d[8:10])
+    if m == 0:
+        y, m = y - 1, 12
+    import calendar
+    target = f"{y:04d}-{m:02d}-{min(day, calendar.monthrange(y, m)[1]):02d}"
+    prev = max((x for x in dates if x <= target), default=None)
+
+    def bp(a, b):
+        return None if a is None or b is None else round((a - b) * 100)
+    y2, y10, m3 = s["DGS2"][d], s["DGS10"][d], s["DGS3MO"].get(d)
+    move = None
+    if prev:
+        d2, d10 = bp(y2, s["DGS2"][prev]), bp(y10, s["DGS10"][prev])
+        ds = d10 - d2
+        if abs(d2) < 3 and abs(d10) < 3:
+            lab = "little changed"
+        elif d2 * d10 < 0:
+            lab = "steepening twist" if ds > 0 else "flattening twist"
+        else:
+            bull = d2 + d10 < 0
+            lab = ("parallel rally" if bull else "parallel sell-off") if abs(ds) < 3 else f"{'bull' if bull else 'bear'} {'steepener' if ds > 0 else 'flattener'}"
+        move = {"label": lab, "d2": d2, "d10": d10, "vs": prev}
+    be10 = s["T10YIE"].get(d)
+    return {"date": d, "y2": y2, "y10": y10, "s2s10": bp(y10, y2), "s3m10y": bp(y10, m3),
+            "real10": round(y10 - be10, 4) if be10 is not None else None, "be10": be10,
+            "be5": s["T5YIE"].get(d), "fwd5y5y": s["T5YIFR"].get(d), "move1m": move}
+
+
 # ----------------------------- regime certainty (z93) ---------------------------
 # Regime shifts are hard to predict. Before anything leans on the regime, ask
 # TRAPP2-1's regime_certainty.json whether the call is DIALED IN (margin,
@@ -2452,9 +2503,19 @@ def main():
         log(f"fed (context, not scored): {fed_ctx.get('stance')} · pace {fed_ctx.get('monthlyPaceBn')}bn/mo · net liquidity "
             f"{fed_ctx.get('netLiquidityBn')}bn (13w {fed_ctx.get('netLiquidity13wBn')}) · statement tone {fed_ctx.get('statementTone')}"
             f" (Δ {fed_ctx.get('toneChange')})")
+    curve = None
+    try:
+        curve = curve_context()
+    except Exception as e:
+        log(f"curve context failed: {e}")
+    if curve:
+        mv = curve.get("move1m") or {}
+        log(f"curve (context, not scored): 2s10s {curve.get('s2s10')} bp · 3m10y {curve.get('s3m10y')} bp · "
+            f"real 10y {curve.get('real10')} · breakeven 10y {curve.get('be10')} · 5y5y {curve.get('fwd5y5y')} · "
+            f"last month: {mv.get('label')} (2Y {mv.get('d2')}, 10Y {mv.get('d10')} bp)")
     regime_ctx = {"regime": (rc or {}).get("regime"), "quad": (rc or {}).get("quadNowcast"),
                   "certainty": (rc or {}).get("certainty"), "dialedIn": not agnostic, "botMode": regime.get("mode"),
-                  "bondTrend": bond, "fed": fed_ctx}
+                  "bondTrend": bond, "fed": fed_ctx, "curve": curve}
     # ex-post: mark every trade whose entry-day regime call has since been judged
     outcomes = regime_call_outcomes(rc)
     for t in trades_list(state):
