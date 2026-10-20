@@ -1071,6 +1071,56 @@ def curve_context(now=None):
             "be5": s["T5YIE"].get(d), "fwd5y5y": s["T5YIFR"].get(d), "move1m": move}
 
 
+def credit_context():
+    """z132: corporate credit on the trade date - CONTEXT, never scored (the bond-trend / Fed / curve
+    rule): ICE BofA high-yield, CCC and investment-grade option-adjusted spreads (bp) from TRAPP2-1's
+    FRED files, their 1-month change, CCC - BB, and the junk-spread band the app shows
+    (tight < 300 bp, normal < 450, wide < 650, stressed < 900, distressed)."""
+    base = f"{RAW}/TRAPP2-1/main/data/macro/"
+
+    def series(sid):
+        d = fetch_json(base + sid + ".json", timeout=20)
+        out = []
+        for o in ((d or {}).get("observations") or []):
+            try:
+                if o.get("date") and o.get("value") not in (None, "", "."):
+                    out.append((o["date"], float(o["value"])))
+            except (TypeError, ValueError):
+                pass
+        return sorted(out)
+    s = {k: series(k) for k in ("BAMLH0A0HYM2", "BAMLH0A3HYC", "BAMLH0A1HYBB", "BAMLC0A0CM")}
+    hy = s["BAMLH0A0HYM2"]
+    if len(hy) < 30:
+        return None
+    d = hy[-1][0]
+    y, m, day = int(d[:4]), int(d[5:7]) - 1, int(d[8:10])
+    if m == 0:
+        y, m = y - 1, 12
+    import calendar
+    target = f"{y:04d}-{m:02d}-{min(day, calendar.monthrange(y, m)[1]):02d}"
+
+    def last(ser, on=None):
+        v = None
+        for dd, x in ser:
+            if on is None or dd <= on:
+                v = x
+            else:
+                break
+        return v
+
+    def bp(v):
+        return None if v is None else round(v * 100)
+    hy_now, hy_then = last(hy), last(hy, target)
+    band = None
+    if hy_now is not None:
+        b = hy_now * 100
+        band = "tight" if b < 300 else "normal" if b < 450 else "wide" if b < 650 else "stressed" if b < 900 else "distressed"
+    ccc, bb = last(s["BAMLH0A3HYC"]), last(s["BAMLH0A1HYBB"])
+    return {"date": d, "hyOas": bp(hy_now), "hy1m": None if hy_then is None else round((hy_now - hy_then) * 100),
+            "cccOas": bp(ccc), "cccMinusBb": None if ccc is None or bb is None else round((ccc - bb) * 100),
+            "igOas": bp(last(s["BAMLC0A0CM"])), "band": band}
+
+
 # ----------------------------- regime certainty (z93) ---------------------------
 # Regime shifts are hard to predict. Before anything leans on the regime, ask
 # TRAPP2-1's regime_certainty.json whether the call is DIALED IN (margin,
@@ -2513,9 +2563,17 @@ def main():
         log(f"curve (context, not scored): 2s10s {curve.get('s2s10')} bp · 3m10y {curve.get('s3m10y')} bp · "
             f"real 10y {curve.get('real10')} · breakeven 10y {curve.get('be10')} · 5y5y {curve.get('fwd5y5y')} · "
             f"last month: {mv.get('label')} (2Y {mv.get('d2')}, 10Y {mv.get('d10')} bp)")
+    credit = None
+    try:
+        credit = credit_context()
+    except Exception as e:
+        log(f"credit context failed: {e}")
+    if credit:
+        log(f"credit (context, not scored): high yield {credit.get('hyOas')} bp ({credit.get('band')}, {credit.get('hy1m')} bp 1M) · "
+            f"CCC {credit.get('cccOas')} bp · CCC-BB {credit.get('cccMinusBb')} bp · IG {credit.get('igOas')} bp")
     regime_ctx = {"regime": (rc or {}).get("regime"), "quad": (rc or {}).get("quadNowcast"),
                   "certainty": (rc or {}).get("certainty"), "dialedIn": not agnostic, "botMode": regime.get("mode"),
-                  "bondTrend": bond, "fed": fed_ctx, "curve": curve}
+                  "bondTrend": bond, "fed": fed_ctx, "curve": curve, "credit": credit}
     # ex-post: mark every trade whose entry-day regime call has since been judged
     outcomes = regime_call_outcomes(rc)
     for t in trades_list(state):
