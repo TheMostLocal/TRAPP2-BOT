@@ -7,8 +7,8 @@ name: Bot equity tape (30-min)
 # want pre/post-market marks too.
 
 on:
-  schedule:
-    - cron: '0,30 13-21 * * 1-5'     # every :00 and :30, 13:00–21:59 UTC, weekdays
+  # z144: retired from the schedule - bot-loop.yml writes an equity point after every runner pass.
+  # Kept for a manual snapshot.
   workflow_dispatch:
 
 concurrency:
