@@ -45,14 +45,8 @@
 name: Autonomous Bot Runner
 
 on:
-  schedule:
-    # z121: the bot trades ONLY in the NYSE regular session (09:30-16:00 ET, 13:00 on
-    # early-close days, never on holidays) - pipeline/market_hours.py decides. These
-    # starts cover the session in EDT (13:30-20:00 UTC) and EST (14:30-21:00 UTC); a
-    # start outside it logs "market closed" and writes nothing. Exits + requests run on
-    # every pass; the entry scan runs once per session, after 10:00 ET.
-    - cron: '5,35 13-20 * * 1-5'
-    - cron: '5 21 * * 1-5'
+  # z144: the schedule moved to bot-loop.yml (a pass every 30 min inside one job; dropped GitHub
+  # triggers no longer stall the book). This workflow stays for manual and dry runs.
   workflow_dispatch:
     inputs:
       dry_run:
