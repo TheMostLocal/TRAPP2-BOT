@@ -1,0 +1,47 @@
+# ============================================================
+#  >>> DESTINATION: TheMostLocal/TRAPP2-BOT
+#  >>> FILE PATH:   .github/workflows/bot-loop.yml
+#
+#  z144 - the bot's scheduler. Hourly triggers (at :17, off GitHub's busy :00 / :05 / :30 / :35)
+#  start a job that runs a runner pass every 30 minutes (:05 / :35 ET) for up to ~170 minutes;
+#  the concurrency group keeps exactly one job running and one queued behind it, so a dropped
+#  trigger no longer leaves the book unmanaged. Same group as bot-runner.yml (manual / dry runs),
+#  so the two never overlap. The one-shot schedules in bot-runner.yml and bot-equity.yml are
+#  retired - this replaces both.
+# ============================================================
+name: Bot loop (runner every 30 min)
+
+on:
+  schedule:
+    - cron: '17 12-22 * * 1-5'     # 0817-1817 EDT / 0717-1717 EST: covers the session and the after-close review
+  workflow_dispatch:
+
+concurrency:
+  group: bot-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  loop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 200
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Runner passes every 30 min (:05 / :35 ET)
+        env:
+          RUNNER_MAX_NEW_TRADES:   ${{ vars.RUNNER_MAX_NEW_TRADES }}
+          RUNNER_MAX_POSITIONS:    ${{ vars.RUNNER_MAX_POSITIONS }}
+          RUNNER_POSITION_PCT:     ${{ vars.RUNNER_POSITION_PCT }}
+          RUNNER_CASH_RESERVE_PCT: ${{ vars.RUNNER_CASH_RESERVE_PCT }}
+          RUNNER_MIN_SCORE:        ${{ vars.RUNNER_MIN_SCORE }}
+          RUNNER_MODE:             ${{ vars.RUNNER_MODE }}
+          SUPABASE_URL:            ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE:   ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          SUPABASE_SERVICE_KEY:    ${{ secrets.SUPABASE_SERVICE_KEY }}
+          LOOP_BUDGET_MIN:         '170'
+        run: bash pipeline/bot_loop.sh
