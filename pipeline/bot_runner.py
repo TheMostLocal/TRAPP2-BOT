@@ -58,6 +58,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import alt_research  # noqa: E402  research-driven gate for crypto & futures
+import trade_book as tb  # noqa: E402  z138: horizons (short / medium / long), options, catalysts, position reviews
 
 # Repo owner — resolved at runtime so the pipeline follows the repos to any
 # GitHub account. Actions sets GITHUB_REPOSITORY_OWNER automatically;
@@ -102,7 +103,9 @@ MACRO_QUAD_URL = f"{RAW}/TRAPP2-1/main/data/macro/quad.json"
 # Option chains live in TRAPP2 (data/options/<TICKER>.json + manifest.json). The
 # runner reads them for the same forward-looking IV/skew/term signals the app
 # uses, plus a market-wide options read (index IV → vol regime + market tilt).
-OPTIONS_BASE = f"{RAW}/TRAPP2/main/data/options"
+OPTIONS_BASE = f"{RAW}/TRAPP2-OPTIONS/main/data/options"          # z138: the options repo (46 chains, Greeks); legacy TRAPP2 as fallback
+OPTIONS_BASE_LEGACY = f"{RAW}/TRAPP2/main/data/options"
+EARNINGS_CAL_URL = f"{RAW}/TRAPP2-ANALYTICS/main/data/earnings/calendar.json"   # z138: catalysts
 OPTIONS_MANIFEST_URL = f"{OPTIONS_BASE}/manifest.json"
 # Index proxies whose ATM IV defines the market's expected move (VIX-like).
 MKT_OPT_INDEXES = ["SPY", "QQQ", "IWM"]
@@ -749,12 +752,22 @@ def resolve_quad(xa, regime_mode):
 
 # --- Options: per-ticker IV signal + market-wide options read (computed once) ---
 _OPT_CACHE = {}          # ticker -> parsed chain (or None)
+_CAL = {}                # z138: earnings calendar {TICKER: {next, beatRate, avgSurprise, n}} (TRAPP2-ANALYTICS)
+
+
+def load_catalysts():
+    global _CAL
+    d = fetch_json(EARNINGS_CAL_URL, timeout=30)
+    _CAL = (d or {}).get("tickers") or {} if isinstance(d, dict) else {}
+    return _CAL
 _OPT_MARKET = {"done": False, "data": None}
 
 def _load_option_chain(ticker):
     if ticker in _OPT_CACHE:
         return _OPT_CACHE[ticker]
     data = fetch_json(f"{OPTIONS_BASE}/{ticker}.json", timeout=25)
+    if not isinstance(data, dict):
+        data = fetch_json(f"{OPTIONS_BASE_LEGACY}/{ticker}.json", timeout=25)
     _OPT_CACHE[ticker] = data if isinstance(data, dict) else None
     return _OPT_CACHE[ticker]
 
@@ -1746,6 +1759,11 @@ def score_symbol(tk, u, ctx):
     pv, _ = pattern_signal(tk, ctx.get("patterns"))
     if pv is not None:
         comps["pattern"] = pv
+    # z138: the catalyst - the next earnings report and how this name has reported (beat rate,
+    # average surprise). A signal in the blend at the default weight; the retrain moves it.
+    cs = tb.catalyst_signal(tb.catalyst_info(_CAL, tk, ctx.get("today") or datetime.now(timezone.utc).strftime("%Y-%m-%d")))
+    if cs is not None and abs(cs) > 0.03:
+        comps["catalyst"] = cs
     return {"comps": comps, "signed": blend_score(comps, ctx["weights"], ctx["weight_mods"])}
 
 
@@ -1785,7 +1803,29 @@ def classify_horizon(comps, confidence):
     return ("core" if (confidence >= CORE_CONF and lean >= 0.45) else "swing"), round(lean, 3)
 
 
-def manage_open_positions(state, universe, today, ctx=None):
+def _review_context(state, universe, today):
+    """z138 - the scoring context for the after-close review (the same signals the session uses,
+    built without the entry-only pieces)."""
+    grades = load_grades()
+    spy_data = fetch_json(SPY_HISTORY_URL, timeout=30)
+    spy_closes = [c for c in ((_f(b.get("close")) or _f(b.get("price"))) for b in spy_data) if c and c > 0] if isinstance(spy_data, list) else None
+    xa = compute_cross_asset()
+    opt_market = compute_options_market(list(universe.keys()))
+    regime = compute_regime(spy_closes, opt_market)
+    mq = fetch_json(f"{RAW}/TRAPP2-1/main/data/macro_quad.json", timeout=20)
+    quad = mq["quad"] if isinstance(mq, dict) and isinstance(mq.get("quad"), int) else resolve_quad(xa, regime.get("mode"))[0]
+    rc = load_regime_certainty()
+    agnostic = not (rc and rc.get("dialedIn"))
+    if agnostic:
+        regime, quad = dict(regime, weightMods={}, longBar=0.0), None
+    weights = state.get("learnedWeights", {}) if isinstance(state.get("learnedWeights"), dict) else {}
+    return {"weights": weights, "weight_mods": regime.get("weightMods", {}), "mode": regime.get("mode", "choppy"),
+            "peer_ranks": peer_rank_table(grades), "xa": xa, "quad": quad, "opt_market": opt_market, "fed": fed_expectation(today),
+            "grades": grades, "today": today, "patterns": load_patterns(use_regime=not agnostic), "regime_agnostic": agnostic,
+            "research": alt_research.ResearchData(fetch_json, RAW, universe, today)}
+
+
+def manage_open_positions(state, universe, today, ctx=None, review_only=False):
     """Mark to market, then apply CONFIDENCE- and HORIZON-aware management:
       • Every held name is re-scored and RE-CLASSIFIED each run (the bot reassesses
         what it holds), so a position that has grown into a high-conviction, macro-
@@ -1797,11 +1837,15 @@ def manage_open_positions(state, universe, today, ctx=None):
         winner is TRIMMED in tiers (+25/50/100%) rather than force-sold — held like a
         value position."""
     closed_now, trimmed_now = [], []
+    review_lines = []                                     # z138: every open position, every pass
     for pos in trades_list(state):
         if pos.get("status") != "open":
             continue
         u = universe.get((pos.get("ticker") or "").upper())
         if not u:
+            # z138: still reviewed - no fresh quote means no action this pass, and the log says so
+            review_lines.append(f"{pos.get('ticker')} {pos.get('direction')} · {tb.horizon_class(pos)} → WAIT: no fresh quote this pass "
+                                f"(last ${pos.get('lastPrice') or pos.get('entryPrice')}) - managed at the next fresh quote")
             continue
         px = u["price"]                     # USD
         entry0 = pos.get("entryPrice")
@@ -1844,16 +1888,73 @@ def manage_open_positions(state, universe, today, ctx=None):
                 pos["longTermLean"] = lean_now
                 # Crypto / futures are tactical, research-driven trades: they keep
                 # their swing stop/target and are never re-classified to CORE.
-                if not is_alt:
+                if not is_alt and not pos.get("horizonClass"):     # z138: a planned horizon stays the plan
                     htype = htype_now
                     pos["horizonType"] = htype
 
         aligned_now = (signed_now * direction) if signed_now is not None else None
         exit_reason = None
+        # z138: the position's plan - sessions held, the minimum hold, the catalyst ahead
+        days_held = tb.sessions_between(pos.get("entryDate"), today, mh.day_status)
+        min_hold = int(pos.get("minHoldDays") or 0)
+        in_hold = days_held < min_hold
+        hc = tb.horizon_class(pos)
+        cat = tb.catalyst_info(_CAL, pos.get("ticker"), today)
+        if pos.get("instrument") == "option":
+            chain = _load_option_chain(pos["ticker"])
+            mark, bid, src = tb.option_mark(pos, chain, px, today)
+            ed = tb._d(pos.get("optionExpiry"))
+            dte = (ed - tb._d(today)).days if ed else None
+            if mark is None:
+                review_lines.append(tb.review(pos, today, price=px, ret=0.0, days_held=days_held, min_hold=min_hold, decision="hold",
+                                              reason="no option mark this pass (chain and model unavailable)", score_now=signed_now, cat=cat, dte=dte))
+                continue
+            prem = pos.get("optionPremium") or 0
+            oret = (mark / prem - 1) if prem else 0.0
+            pos["optionMark"], pos["optionMarkAt"], pos["optionMarkSource"] = round(mark, 4), today, src
+            pos["pnl"] = tb.option_pnl(pos, mark)
+            pos["returnPct"] = round(oret * 100, 2)
+            hz = tb.HZ[hc]
+            if dte is not None and dte <= 0:
+                exit_reason = "expiry"
+            elif not in_hold:
+                if oret <= -tb.OPT_STOP:
+                    exit_reason = "option-stop"
+                elif oret >= hz["opt_tp"]:
+                    exit_reason = "option-target"
+                elif dte is not None and dte <= hz["exit_dte"]:
+                    exit_reason = "time (expiry near)"
+                elif aligned_now is not None and aligned_now <= -CORE_EXIT_SCORE:
+                    exit_reason = "thesis-break"
+            if exit_reason and review_only:
+                review_lines.append(tb.review(pos, today, price=px, ret=oret, days_held=days_held, min_hold=min_hold, decision="flag",
+                                              reason=f"{exit_reason} - acts at the next session's first pass", score_now=signed_now, cat=cat,
+                                              mark=mark, mark_src=src, dte=dte))
+                continue
+            if exit_reason:
+                exit_px = mark if exit_reason == "expiry" else (bid if bid else mark)
+                r = tb.option_pnl(pos, exit_px, fee_sides=2)          # entry + exit commissions
+                pos.update({"status": "closed", "exitDate": today, "exitPrice": px, "optionExit": round(exit_px, 4),
+                            "exitReason": exit_reason, "realizedPL": r, "pnl": r, "won": r > 0,
+                            "returnPct": round(r / (pos.get("notional") or 1) * 100, 2)})
+                state["bankroll"] = round(state.get("bankroll", STARTING_BANKROLL) + r, 2)
+                closed_now.append((pos["ticker"], exit_reason, r))
+                review_lines.append(tb.review(pos, today, price=px, ret=oret, days_held=days_held, min_hold=min_hold, decision="close",
+                                              reason=f"{exit_reason} - sold at ${exit_px:.2f} ({src})", score_now=signed_now, cat=cat,
+                                              mark=mark, mark_src=src, dte=dte))
+            else:
+                why = (f"minimum hold ({days_held}/{min_hold} sessions) - only expiry can close it" if in_hold else
+                       f"inside the plan: stop at −{tb.OPT_STOP:.0%}, take profit at +{hz['opt_tp']:.0%}, roll off at {hz['exit_dte']} DTE")
+                review_lines.append(tb.review(pos, today, price=px, ret=oret, days_held=days_held, min_hold=min_hold, decision="hold",
+                                              reason=why, score_now=signed_now, cat=cat, mark=mark, mark_src=src, dte=dte))
+            continue
+        hold_disaster = tb.HZ[hc]["disaster"]
 
         if htype == "core":
             if ret <= -CORE_HARD_STOP:
                 exit_reason = "hard-stop"
+            elif in_hold:
+                pass                                       # z138: inside the minimum hold only the hard stop can close it
             elif aligned_now is not None and aligned_now <= -CORE_EXIT_SCORE:
                 exit_reason = "thesis-break"
             elif peak_ret >= 0.10 and direction == 1 and px <= peak * (1 - CORE_TRAIL):
@@ -1863,7 +1964,7 @@ def manage_open_positions(state, universe, today, ctx=None):
             else:
                 # TRIM winners in tiers instead of a hard target exit (long only).
                 tier = int(pos.get("trimTier") or 0)
-                if direction == 1 and tier < len(CORE_TRIM_TIERS) and ret >= CORE_TRIM_TIERS[tier]:
+                if not review_only and direction == 1 and tier < len(CORE_TRIM_TIERS) and ret >= CORE_TRIM_TIERS[tier]:
                     trim_shares = round(shares * CORE_TRIM_FRAC, 4)
                     if trim_shares > 0 and (shares - trim_shares) > 0:
                         realized = round((px - entry) * trim_shares - abs(px * trim_shares) * FEE_BPS, 2)
@@ -1880,7 +1981,10 @@ def manage_open_positions(state, universe, today, ctx=None):
                 # else: HOLD — ride it; no calendar exit
         else:
             stop, target = pos.get("stopPrice"), pos.get("targetPrice")
-            if stop and ((direction == 1 and px <= stop) or (direction == -1 and px >= stop)):
+            if in_hold:
+                if ret <= -hold_disaster:                  # z138: inside the minimum hold only a disaster move closes it
+                    exit_reason = "disaster-stop"
+            elif stop and ((direction == 1 and px <= stop) or (direction == -1 and px >= stop)):
                 exit_reason = "stop-loss"
             elif target and ((direction == 1 and px >= target) or (direction == -1 and px <= target)):
                 exit_reason = "target"
@@ -1892,6 +1996,12 @@ def manage_open_positions(state, universe, today, ctx=None):
             else:
                 # Horizon exit ONLY when the reason to hold (the signal) has faded.
                 ed = pos.get("entryDate")
+                if pos.get("horizonClass"):
+                    # z138: the plan is in SESSIONS, and the signal must actually be re-scored as faded
+                    planned = int(pos.get("horizonDaysPlanned") or tb.HZ[hc]["days"])
+                    if aligned_now is not None and aligned_now < MIN_SCORE and days_held >= planned:
+                        exit_reason = "horizon"
+                    ed = None
                 hd = pos.get("horizonDays") or SWING_HORIZON
                 signal_gone = (aligned_now is None) or (aligned_now < MIN_SCORE)
                 if ed and hd and signal_gone:
@@ -1902,6 +2012,10 @@ def manage_open_positions(state, universe, today, ctx=None):
                     except ValueError:
                         pass
 
+        if exit_reason and review_only:
+            review_lines.append(tb.review(pos, today, price=px, ret=ret, days_held=days_held, min_hold=min_hold, decision="flag",
+                                          reason=f"{exit_reason} at ${px:,.2f} - acts at the next session's first pass", score_now=signed_now, cat=cat))
+            continue
         if exit_reason:
             r = realized_pnl(pos, px)
             pos["status"] = "closed"
@@ -1917,6 +2031,24 @@ def manage_open_positions(state, universe, today, ctx=None):
             pos["sharesAtExit"] = round(shares or 0, 4)
             state["bankroll"] = round(state.get("bankroll", STARTING_BANKROLL) + r, 2)
             closed_now.append((pos["ticker"], exit_reason, total_r))
+        # z138: the review - what it is, how it's doing, what's ahead, what the bot decided and why
+        if exit_reason:
+            decision, why = "close", f"{exit_reason} at ${px:,.2f}"
+        elif trimmed_now and trimmed_now[-1][0] == pos.get("ticker") and pos.get("trims") and pos["trims"][-1].get("date") == today:
+            decision, why = "trim", f"tier {pos.get('trimTier')} at {ret * 100:+.1f}% - riding the rest"
+        elif in_hold:
+            decision, why = "hold", f"minimum hold ({days_held}/{min_hold} sessions) - only a −{hold_disaster:.0%} move closes it"
+        elif aligned_now is not None and aligned_now < MIN_SCORE:
+            decision, why = "hold", f"signal faded to {aligned_now:+.2f} - exits at the stop / target or the {pos.get('horizonDaysPlanned') or pos.get('horizonDays') or '—'}-session horizon"
+        else:
+            decision, why = "hold", ("thesis intact" + (f" (score {aligned_now:+.2f})" if aligned_now is not None else ""))
+        review_lines.append(tb.review(pos, today, price=px, ret=ret, days_held=days_held, min_hold=min_hold, decision=decision,
+                                      reason=why, score_now=signed_now, cat=cat))
+    for line in review_lines:
+        log("  review " + line)
+    state["lastPositionReview"] = {"at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "date": today,
+                                   "positions": len(review_lines), "closed": len(closed_now), "trimmed": len(trimmed_now),
+                                   "kind": "after-close review (no trades)" if review_only else "session pass"}
     for tk, why, r in closed_now:
         log(f"  closed {tk} ({why}) realized ${r:,.2f}")
     for tk, sh, r, tier in trimmed_now:
@@ -2046,11 +2178,14 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                                "price": u["price"], "sector": u["sector"], "name": u["name"],
                                "priceLocal": u.get("priceLocal"), "currency": u.get("currency"), "fxRate": u.get("fxRate"),
                                "entryReason": entry_reason})
-        elif ALLOW_SHORTS and signed <= SHORT_SCORE and len(trigs) >= MIN_TRIGGERS:
+        elif signed <= SHORT_SCORE and len(trigs) >= MIN_TRIGGERS and \
+                (ALLOW_SHORTS or tb.chain_fresh(_load_option_chain(tk), today)):
+            # z138: a bearish idea trades as a short sale (RUNNER_ALLOW_SHORTS) or as a put - defined risk
             candidates.append({"ticker": tk, "score": abs(signed), "direction": "short",
                                "components": comps, "confidence": conf, "triggers": trigs,
                                "price": u["price"], "sector": u["sector"], "name": u["name"],
-                               "priceLocal": u.get("priceLocal"), "currency": u.get("currency"), "fxRate": u.get("fxRate")})
+                               "priceLocal": u.get("priceLocal"), "currency": u.get("currency"), "fxRate": u.get("fxRate"),
+                               "putOnly": not ALLOW_SHORTS})
     candidates.sort(key=lambda c: c["score"], reverse=True)
     n_long = sum(1 for c in candidates if c["direction"] == "long")
     n_short = sum(1 for c in candidates if c["direction"] == "short")
@@ -2101,6 +2236,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                 candidates.insert(slots - 1, best)
                 log(f"  reserved a slot for pattern-led {best['ticker']} (score {best['score']:.2f}, "
                     f"{best.get('entryReason', 'blend')})")
+    cell_count = {}                                            # z138: direction × horizon × instrument, this session
     for c in candidates:
         if len(opened) >= slots:
             break
@@ -2123,21 +2259,79 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         if alt:
             htype = "swing"            # research-driven alt trades are tactical
         is_short = c.get("direction") == "short"
-        # Confidence-scaled sizing: 0.6x (low) → 1.4x (high), hard-capped at 1.6x base.
-        size = min(bankroll * POSITION_PCT * (0.6 + 0.8 * conf),
-                   deployable, bankroll * POSITION_PCT * 1.6)
+        # z138: horizon (short / medium / long, steered toward the book's mix), then the instrument
+        cat = tb.catalyst_info(_CAL, c["ticker"], today)
+        mix = tb.open_mix(trades_list(state))
+        hclass, h_why, steered = tb.choose_horizon(conf, lean, cat, c.get("direction"), mix, CORE_CONF)
         if alt:
-            size *= alt["sizeMult"]    # smaller + volatility-scaled for crypto / futures
-        if size < bankroll * MIN_POSITION_PCT:
-            if alt:
-                continue
-            break
-        shares = round(size / c["price"], 4)
-        if shares <= 0:
+            hclass, h_why, steered = "short", "research-driven alt trade (tactical)", False
+        cell = f"{c.get('direction')}|{hclass}"
+        option = None
+        chain = None if alt else _load_option_chain(c["ticker"])
+        cat_in_window = bool(cat and cat.get("days") is not None and 1 <= cat["days"] <= tb.HZ[hclass]["days"] + 5
+                             and abs(c["components"].get("catalyst") or 0) >= 0.10)
+        if not alt and (conf >= tb.OPT_CONF or cat_in_window or c.get("putOnly")) and tb.chain_fresh(chain, today):
+            prem_open = sum((p.get("notional") or 0) for p in trades_list(state) if p.get("status") == "open" and p.get("instrument") == "option")
+            option, o_why = tb.pick_contract(chain, c.get("direction"), hclass, today, cat if cat_in_window else None)
+            if option and prem_open >= bankroll * tb.OPT_BOOK_PCT:
+                option, o_why = None, f"option book full ({prem_open / bankroll:.1%} of the bankroll at risk)"
+            if not option:
+                log(f"  {c['ticker']}: no option ({o_why})" + ("" if not c.get("putOnly") else " - bearish idea skipped (shorts off)"))
+        if c.get("putOnly") and not option:
             continue
-        notional = round(shares * c["price"], 2)
-        fees = round(notional * FEE_BPS, 2)
-        if htype == "core":
+        cell = f"{cell}|{'option' if option else 'shares'}"
+        if cell_count.get(cell, 0) >= 2:
+            continue                       # z138: variety - at most two new trades per direction × horizon × instrument per session
+        explore = not any(tb.horizon_class(p) == hclass and p.get("direction") == c.get("direction")
+                          and (p.get("instrument") == "option") == bool(option)
+                          for p in trades_list(state) if p.get("status") == "open")
+        if option:
+            # premium = 1.0 % → 2.5 % of the bankroll with confidence; the premium is the most it can lose
+            budget = tb.option_budget(bankroll, conf, explore)        # 1 % → 2.5 %; deep conviction 4 %
+            contracts = int(min(budget, deployable) // (option["ask"] * 100))
+            if contracts < 1:
+                log(f"  {c['ticker']}: one contract (${option['ask'] * 100:,.0f}) exceeds the option budget (${budget:,.0f})")
+                if c.get("putOnly"):
+                    continue
+                option = None
+        if option:
+            shares = 0
+            notional = round(contracts * option["ask"] * 100, 2)
+            fees = round(tb.OPT_FEE * contracts, 2)
+        else:
+            # Confidence-scaled sizing: 0.6x (low) → 1.4x (high), hard-capped at 1.6x base.
+            size = min(bankroll * POSITION_PCT * (0.6 + 0.8 * conf),
+                       deployable, bankroll * POSITION_PCT * 1.6)
+            if alt:
+                size *= alt["sizeMult"]    # smaller + volatility-scaled for crypto / futures
+            if explore and not alt:
+                size *= 0.7                # z138: a first trade in an empty cell is a smaller, exploratory one
+            if size < bankroll * MIN_POSITION_PCT:
+                if alt:
+                    continue
+                break
+            shares = round(size / c["price"], 4)
+            if shares <= 0:
+                continue
+            notional = round(shares * c["price"], 2)
+            fees = round(notional * FEE_BPS, 2)
+        if option:
+            stop = target = None
+            horizon_days = tb.HZ[hclass]["days"]
+            style = f"option-{hclass}"
+            htype = "core" if hclass == "long" else "swing"
+        elif hclass in ("short", "medium") and not alt:
+            hz = tb.HZ[hclass]
+            stop = round(c["price"] * ((1 + hz["stop"]) if is_short else (1 - hz["stop"])), 4)
+            target = round(c["price"] * ((1 - hz["target"]) if is_short else (1 + hz["target"])), 4)
+            horizon_days = hz["days"]
+            style = "catalyst" if (cat_in_window and hclass == "short") else ("momentum" if hclass == "short" else "swing")
+            htype = "swing"
+        elif hclass == "long" and not alt:
+            htype = "core"
+        if option or (hclass in ("short", "medium") and not alt):
+            pass                           # z138: set above (option / short / medium shares)
+        elif htype == "core":
             stop = round(c["price"] * ((1 + CORE_HARD_STOP) if is_short else (1 - CORE_HARD_STOP)), 4)
             target = None                                   # ride it; managed by trim + thesis-break
             horizon_days = None                             # no fixed-calendar exit
@@ -2155,7 +2349,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             style = "momentum"
         trigs = c.get("triggers", [])
         trade = {
-            "id": f"{c['ticker']}-{today}-runner-{int(datetime.now(timezone.utc).timestamp())}",
+            "id": f"{c['ticker']}-{today}-runner-{int(datetime.now(timezone.utc).timestamp())}{'-opt' if option else ''}",
             "ticker": c["ticker"], "name": c["name"], "sector": c["sector"],
             "direction": "short" if is_short else "long", "instrument": "shares",
             "style": style, "horizonType": htype, "horizonDays": horizon_days,
@@ -2185,7 +2379,25 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             # what the bot believed about the regime when it entered, and whether
             # it used it - so a win can't credit a regime call that was wrong
             "regimeContext": regime_ctx,
+            # z138: how long it means to hold, why, and what it's waiting for
+            "horizonClass": hclass, "horizonReason": h_why, "steered": steered, "explore": explore,
+            "horizonDaysPlanned": tb.HZ[hclass]["days"], "minHoldDays": tb.HZ[hclass]["min_hold"],
+            "plannedExitBy": (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=round(tb.HZ[hclass]["days"] * 7 / 5))).strftime("%Y-%m-%d"),
+            "catalyst": cat,
         }
+        if option:
+            trade.update({"instrument": "option", "optionType": option["type"], "optionStrike": option["strike"],
+                          "optionExpiry": option["expiry"], "optionContracts": contracts, "optionPremium": option["ask"],
+                          "optionMark": option["mid"], "optionMarkAt": today, "optionDelta": option.get("delta"),
+                          "optionIV": option.get("iv"), "optionChainAsOf": option.get("chainAsOf"), "multiplier": 100,
+                          "maxLoss": notional, "leverage": 1})
+            trade["rationale"].append(
+                f"OPTION {option['type'].upper()} {option['strike']} exp {option['expiry']} ({option['dte']}d) ×{contracts} @ ${option['ask']:.2f} ask"
+                f" · Δ {option.get('delta')} · premium ${notional:,.0f} = the most it can lose" +
+                (" · catalyst inside the horizon" if cat_in_window else f" · conviction {conf:.2f}"))
+        trade["rationale"].append(f"{hclass.upper()} horizon (~{tb.HZ[hclass]['days']} sessions, min hold {tb.HZ[hclass]['min_hold']}): {h_why}"
+                                  + (" · exploratory size" if explore else "") +
+                                  (f" · earnings {cat['date']} ({cat['days']}d, beat rate {cat.get('beatRate')})" if cat and cat.get("date") else ""))
         pv, pdet = pattern_signal(c["ticker"], patterns)
         if pdet:
             trade["pattern"] = {"value": round(pv, 3), "calls": pdet[:3], "scanAsOf": (patterns or {}).get("asOf")}
@@ -2213,12 +2425,16 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         cash -= notional
         deployable -= notional
         primary_count[primary] = primary_count.get(primary, 0) + 1
+        cell_count[cell] = cell_count.get(cell, 0) + 1
         state.setdefault("trades", []).append(trade)
         opened.append((c["ticker"], notional, c["score"]))
         if not state.get("startedAt"):
             state["startedAt"] = today
     for tk, notional, sc in opened:
-        log(f"  opened {tk} ${notional:,.0f} (score {sc:.2f})")
+        t = next((x for x in reversed(trades_list(state)) if x.get("ticker") == tk and x.get("status") == "open"), {})
+        what = (f"{t.get('optionType', '').upper()} {t.get('optionStrike')} {t.get('optionExpiry')} ×{t.get('optionContracts')}"
+                if t.get("instrument") == "option" else f"{t.get('direction')} shares")
+        log(f"  opened {tk} {what} · {t.get('horizonClass', '?')} · ${notional:,.0f} (score {sc:.2f})")
     return opened
 
 
@@ -2479,6 +2695,28 @@ def main():
         # z121: nothing trades outside the NYSE regular session - nights, weekends, holidays,
         # after a 1 pm early close. Bookkeeping still applies (adopting a device's trades,
         # cash in / out); close / trim requests wait in the inbox for the session.
+        # z138: once per trading day, after the close, every open position gets a full review at the
+        # closing prices (thesis re-scored, catalysts, stops / targets / expiries) - analysis only;
+        # anything it flags acts at the next session's first pass.
+        et = mh.et_now(now_utc)
+        ok_day, close_min, _ = mh.day_status(et.date())
+        eod = ok_day and close_min is not None and (et.hour * 60 + et.minute) >= close_min
+        if eod and (state.get("lastPositionReview") or {}).get("date") != sess["date"] and any(t.get("status") == "open" for t in trades_list(state)):
+            log("after-close review: every open position at the closing prices (no trades)")
+            try:
+                load_catalysts()
+            except Exception:
+                pass
+            review_ctx = None
+            try:
+                review_ctx = _review_context(state, universe, sess["date"])
+            except Exception as e:
+                log(f"  review without re-scoring ({e})")
+            manage_open_positions(state, universe, sess["date"], review_ctx, review_only=True)
+            finalize_state(state, sig_before)
+            recompute(state, universe, today)
+            _write_state(state, "after-close review of open positions (no trades)")
+            return
         if not app_done:
             log("market closed - no trades; journal unchanged (nothing written)")
             return
@@ -2494,6 +2732,12 @@ def main():
         _write_state(state, f"actions-only pass: {len(app_done)} applied · bankroll ${state['bankroll']:,.2f}")
         return
 
+    # z138: catalysts (earnings calendar + beat record) for scoring, horizons and reviews
+    try:
+        n_cal = len(load_catalysts())
+        log(f"catalysts: earnings calendar for {n_cal} tickers")
+    except Exception as e:
+        log(f"catalysts unavailable ({e})")
     # Macro + cross-sectional context (faithful peer-grade + regime signals).
     grades = load_grades()
     peer_ranks = peer_rank_table(grades)
@@ -2583,7 +2827,7 @@ def main():
     weights = state.get("learnedWeights", {}) if isinstance(state.get("learnedWeights"), dict) else {}
     ctx = {"weights": weights, "weight_mods": regime.get("weightMods", {}),
            "mode": regime.get("mode", "choppy"), "peer_ranks": peer_ranks,
-           "xa": xa, "quad": quad, "opt_market": opt_market, "fed": fed, "grades": grades}
+           "xa": xa, "quad": quad, "opt_market": opt_market, "fed": fed, "grades": grades, "today": today}
     # Research layer for crypto / futures (drivers, supply chain, news, regime,
     # seasonality) - shared cache for management + new entries.
     ctx["research"] = alt_research.ResearchData(fetch_json, RAW, universe, today)
