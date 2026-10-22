@@ -1825,6 +1825,37 @@ def _review_context(state, universe, today):
             "research": alt_research.ResearchData(fetch_json, RAW, universe, today)}
 
 
+def _rotation_pool(state, today):
+    """z140: open SHARE positions this pass re-scored below the entry bar, past their minimum hold
+    (legacy positions: 5 sessions) - weakest first, as (aligned score, position)."""
+    out = []
+    for p in trades_list(state):
+        if p.get("status") != "open" or p.get("instrument", "shares") != "shares":
+            continue
+        r = p.get("lastReview") or {}
+        if r.get("at") != today or r.get("scoreNow") is None or r.get("decision") not in ("hold", None):
+            continue
+        aligned = r["scoreNow"] * (-1 if p.get("direction") == "short" else 1)
+        held = r.get("daysHeld") if r.get("daysHeld") is not None else tb.sessions_between(p.get("entryDate"), today, mh.day_status)
+        if aligned < MIN_SCORE and held >= max(int(p.get("minHoldDays") or 0), 5):
+            out.append((round(aligned, 3), p))
+    return sorted(out, key=lambda x: x[0])
+
+
+def _rotate_out(state, pos, px, today, why):
+    """Close a share position at px for a rotation (same accounting as any exit). Returns the cash freed."""
+    entry = pos.get("entryPrice") or px
+    shares = pos.get("shares") or ((pos.get("notional") or 0) / entry if entry else 0)
+    r = realized_pnl(pos, px)
+    total_r = round(r + (pos.get("realizedTrim") or 0), 2)
+    freed = (pos.get("notional") or 0) + r
+    pos.update({"status": "closed", "exitDate": today, "exitPrice": px, "exitReason": "rotation", "rotationNote": why,
+                "realizedPL": total_r, "pnl": total_r, "won": total_r > 0, "sharesAtExit": round(shares or 0, 4),
+                "returnPct": round((r / (shares * entry)) * 100, 2) if shares and entry else 0})
+    state["bankroll"] = round(state.get("bankroll", STARTING_BANKROLL) + r, 2)
+    return freed
+
+
 def manage_open_positions(state, universe, today, ctx=None, review_only=False):
     """Mark to market, then apply CONFIDENCE- and HORIZON-aware management:
       • Every held name is re-scored and RE-CLASSIFIED each run (the bot reassesses
@@ -2041,7 +2072,7 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
         elif aligned_now is not None and aligned_now < MIN_SCORE:
             decision, why = "hold", f"signal faded to {aligned_now:+.2f} - exits at the stop / target or the {pos.get('horizonDaysPlanned') or pos.get('horizonDays') or '—'}-session horizon"
         else:
-            decision, why = "hold", ("thesis intact" + (f" (score {aligned_now:+.2f})" if aligned_now is not None else ""))
+            decision, why = "hold", ("thesis intact" + (f" (aligned {aligned_now:+.2f} in its direction)" if aligned_now is not None else ""))
         review_lines.append(tb.review(pos, today, price=px, ret=ret, days_held=days_held, min_hold=min_hold, decision=decision,
                                       reason=why, score_now=signed_now, cat=cat))
     for line in review_lines:
@@ -2106,9 +2137,21 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
     cash = bankroll - committed
     reserve = bankroll * CASH_RESERVE_PCT
     deployable = max(0.0, cash - reserve)
-    if deployable < bankroll * 0.02:
-        log(f"  only ${deployable:,.0f} deployable after reserve — sitting out")
-        return []
+    # z140 (owner direction §1d - new positions are welcome, a mix of everything): a fully invested book
+    # still trades. Options (defined risk) may use half of the cash reserve, and ONE faded position
+    # (past its minimum hold, re-scored below the entry bar this pass) may be rotated out for a clearly
+    # stronger idea (+0.15 score). Before z140 the runner just sat out whenever the book was full.
+    opt_room = max(0.0, cash - reserve * 0.5)
+    rot_pool = _rotation_pool(state, today)
+    constrained = deployable < bankroll * 0.02
+    rotations = 0
+    if constrained:
+        if opt_room < bankroll * tb.OPT_TRADE_PCT[0] and not rot_pool:
+            log(f"  only ${deployable:,.0f} deployable after reserve, no option room, nothing faded to rotate — sitting out")
+            return []
+        weakest = ", ".join(str(p.get("ticker")) + f" {a:+.2f}" for a, p in rot_pool[:3]) or "none"
+        log(f"  fully invested: ${deployable:,.0f} after the reserve · option room ${opt_room:,.0f} (half the reserve) · "
+            f"{len(rot_pool)} faded position(s) eligible to rotate (weakest: {weakest})")
 
     candidates = []
     scanned = 0
@@ -2288,9 +2331,11 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         if option:
             # premium = 1.0 % → 2.5 % of the bankroll with confidence; the premium is the most it can lose
             budget = tb.option_budget(bankroll, conf, explore)        # 1 % → 2.5 %; deep conviction 4 %
-            contracts = int(min(budget, deployable) // (option["ask"] * 100))
+            cap_now = min(budget, max(deployable, opt_room) if constrained else deployable)
+            contracts = int(cap_now // (option["ask"] * 100))
             if contracts < 1:
-                log(f"  {c['ticker']}: one contract (${option['ask'] * 100:,.0f}) exceeds the option budget (${budget:,.0f})")
+                log(f"  {c['ticker']}: one contract (${option['ask'] * 100:,.0f}) is more than the ${cap_now:,.0f} available "
+                    f"(budget ${budget:,.0f}{f', option room left ${opt_room:,.0f}' if constrained else ''})")
                 if c.get("putOnly"):
                     continue
                 option = None
@@ -2298,7 +2343,22 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             shares = 0
             notional = round(contracts * option["ask"] * 100, 2)
             fees = round(tb.OPT_FEE * contracts, 2)
+            opt_room -= notional
         else:
+            if constrained and deployable < bankroll * 0.02:
+                # z140: shares need cash - rotate one faded position out if this idea is clearly stronger
+                if alt or rotations >= 1 or not rot_pool or c["score"] - rot_pool[0][0] < 0.15:
+                    continue
+                weak_al, weak = rot_pool.pop(0)
+                wu = universe.get((weak.get("ticker") or "").upper())
+                if not wu:
+                    continue
+                freed = _rotate_out(state, weak, wu["price"], today,
+                                    f"rotation: faded to {weak_al:+.2f}, capital to {c['ticker']} (score {c['score']:.2f})")
+                rotations += 1
+                deployable += freed
+                bankroll = state.get("bankroll", bankroll)
+                log(f"  rotated out {weak.get('ticker')} (faded {weak_al:+.2f}, realized ${weak.get('realizedPL', 0):,.2f}) → room for {c['ticker']} (score {c['score']:.2f})")
             # Confidence-scaled sizing: 0.6x (low) → 1.4x (high), hard-capped at 1.6x base.
             size = min(bankroll * POSITION_PCT * (0.6 + 0.8 * conf),
                        deployable, bankroll * POSITION_PCT * 1.6)
