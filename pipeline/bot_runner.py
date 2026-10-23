@@ -1084,6 +1084,38 @@ def curve_context(now=None):
             "be5": s["T5YIE"].get(d), "fwd5y5y": s["T5YIFR"].get(d), "move1m": move}
 
 
+HEADCOUNT_BASE = f"{RAW}/TRAPP2-ANALYTICS/main/data/headcount"
+_HC = {}                 # z151: {TICKER: {employees, yoyPct, fromPeakPct, date, cadence}}
+
+
+def labor_context():
+    """z151 - the market's hiring breadth (TRAPP2-ANALYTICS headcount): share of companies cutting vs
+    growing staff year over year and the aggregate change. Recorded on every trade as context, NOT scored
+    (evidence before scoring): one company trimming staff raises an eyebrow; many at once is how a
+    slowdown shows up in the labor data."""
+    global _HC
+    idx = fetch_json(f"{HEADCOUNT_BASE}/index.json", timeout=30)
+    _HC = (idx or {}).get("tickers") or {} if isinstance(idx, dict) else {}
+    s = fetch_json(f"{HEADCOUNT_BASE}/summary.json", timeout=30)
+    n = (s or {}).get("now") if isinstance(s, dict) else None
+    if not n:
+        return None
+    pc = n.get("pctCutting")
+    read_ = "broad" if (pc or 0) >= 40 else "spreading" if (pc or 0) >= 25 else "contained"
+    return {"pctCutting": pc, "pctGrowing": n.get("pctGrowing"), "aggregateYoY": n.get("aggregateYoY"),
+            "medianYoY": n.get("medianYoY"), "companies": n.get("companies"), "read": read_, "asOf": (s or {}).get("asOf")}
+
+
+def headcount_of(ticker):
+    """z151: a company's headcount for the trade record (context): employees, YoY, from peak."""
+    h = _HC.get(str(ticker or "").upper())
+    if not h:
+        return None
+    e = h.get("employees") or 0
+    return {"employees": e, "yoyPct": h.get("yoyPct"), "fromPeakPct": h.get("fromPeakPct"), "date": h.get("date"),
+            "scale": "large employer (10k+)" if e >= 10000 else "mid (1k-10k)" if e >= 1000 else "small (<1k)"}
+
+
 def credit_context():
     """z132: corporate credit on the trade date - CONTEXT, never scored (the bond-trend / Fed / curve
     rule): ICE BofA high-yield, CCC and investment-grade option-adjusted spreads (bp) from TRAPP2-1's
@@ -2444,6 +2476,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             "horizonDaysPlanned": tb.HZ[hclass]["days"], "minHoldDays": tb.HZ[hclass]["min_hold"],
             "plannedExitBy": (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=round(tb.HZ[hclass]["days"] * 7 / 5))).strftime("%Y-%m-%d"),
             "catalyst": cat,
+            "headcount": headcount_of(c["ticker"]),             # z151: context, not scored
         }
         if option:
             trade.update({"instrument": "option", "optionType": option["type"], "optionStrike": option["strike"],
@@ -2875,9 +2908,17 @@ def main():
     if credit:
         log(f"credit (context, not scored): high yield {credit.get('hyOas')} bp ({credit.get('band')}, {credit.get('hy1m')} bp 1M) · "
             f"CCC {credit.get('cccOas')} bp · CCC-BB {credit.get('cccMinusBb')} bp · IG {credit.get('igOas')} bp")
+    labor = None
+    try:
+        labor = labor_context()
+    except Exception as e:
+        log(f"labor context failed: {e}")
+    if labor:
+        log(f"labor (context, not scored): {labor.get('pctCutting')} % of {labor.get('companies')} companies cutting headcount YoY, "
+            f"{labor.get('pctGrowing')} % growing, aggregate {labor.get('aggregateYoY')} % - {labor.get('read')} · headcount on file for {len(_HC)} companies")
     regime_ctx = {"regime": (rc or {}).get("regime"), "quad": (rc or {}).get("quadNowcast"),
                   "certainty": (rc or {}).get("certainty"), "dialedIn": not agnostic, "botMode": regime.get("mode"),
-                  "bondTrend": bond, "fed": fed_ctx, "curve": curve, "credit": credit}
+                  "bondTrend": bond, "fed": fed_ctx, "curve": curve, "credit": credit, "labor": labor}
     # ex-post: mark every trade whose entry-day regime call has since been judged
     outcomes = regime_call_outcomes(rc)
     for t in trades_list(state):
