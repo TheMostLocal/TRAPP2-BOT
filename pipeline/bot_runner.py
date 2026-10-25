@@ -1088,6 +1088,45 @@ HEADCOUNT_BASE = f"{RAW}/TRAPP2-ANALYTICS/main/data/headcount"
 _HC = {}                 # z151: {TICKER: {employees, yoyPct, fromPeakPct, date, cadence}}
 
 
+_SEC = {}               # z158: {TICKER: {red30, caution30, insider, lastEvent}}
+_SHORT = {"volume": {}, "interest": {}}
+NO_LONG_ITEMS = {"1.03": "bankruptcy", "4.02": "non-reliance on past financials", "3.01": "delisting notice"}
+
+
+def load_filings_and_short():
+    """z158: SEC events / insiders (TRAPP2-ANALYTICS data/sec) and FINRA short data (data/short)."""
+    global _SEC, _SHORT
+    j = fetch_json(f"{RAW}/TRAPP2-ANALYTICS/main/data/sec/index.json", timeout=30)
+    _SEC = (j or {}).get("tickers") or {} if isinstance(j, dict) else {}
+    s = fetch_json(f"{RAW}/TRAPP2-ANALYTICS/main/data/short/index.json", timeout=30)
+    _SHORT = {"volume": (s or {}).get("volume") or {}, "interest": (s or {}).get("interest") or {}} if isinstance(s, dict) else {"volume": {}, "interest": {}}
+    log(f"filings / short: SEC on file for {len(_SEC)} companies ({sum(1 for v in _SEC.values() if v.get('red30'))} with a red-flag 8-K in 30 days) · "
+        f"short volume {len(_SHORT['volume'])} · short interest {len(_SHORT['interest'])}")
+
+
+def filings_of(ticker):
+    """z158 context for a trade record: recent 8-K flags, insider buying / selling (90 days), short selling."""
+    t = str(ticker or "").upper()
+    s, v, i = _SEC.get(t) or {}, _SHORT["volume"].get(t), _SHORT["interest"].get(t)
+    if not (s or v or i):
+        return None
+    ins = s.get("insider") or {}
+    return {"red30": s.get("red30") or [], "caution30": s.get("caution30") or [], "events30": s.get("events30"),
+            "insiderNet90": ins.get("net"), "insiderBuyers90": ins.get("buyers"), "insiderSellers90": ins.get("sellers"), "clusterBuy": ins.get("cluster"),
+            "shortVol5d": (v or {}).get("ratio5d"), "shortVolZ": (v or {}).get("z"),
+            "shortInterestChgPct": (i or {}).get("changePct"), "daysToCover": (i or {}).get("daysToCover")}
+
+
+def volatility_context():
+    """z158: CBOE term structure and SKEW (TRAPP2-1 data/extras/vol.json) - context, not scored."""
+    v = fetch_json(f"{RAW}/TRAPP2-1/main/data/extras/vol.json", timeout=30)
+    if not isinstance(v, dict) or not v.get("latest"):
+        return None
+    L = v["latest"]
+    return {"vix": L.get("VIX"), "vix3m": L.get("VIX3M"), "vixTo3m": v.get("vixTo3m"), "structure": v.get("structure"),
+            "vixPctile1y": v.get("vixPctile1y"), "skew": L.get("SKEW"), "skewPctile1y": v.get("skewPctile1y"), "date": v.get("date")}
+
+
 def labor_context():
     """z151 - the market's hiring breadth (TRAPP2-ANALYTICS headcount): share of companies cutting vs
     growing staff year over year and the aggregate change. Recorded on every trade as context, NOT scored
@@ -2329,6 +2368,12 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             if cls_c == "future" and open_groups.get(grp_c, 0) >= alt_research.MAX_PER_GROUP:
                 log(f"  skip {c['ticker']}: already hold a {grp_c} future")
                 continue
+        # z158: a hard guard, not a score - no NEW long in a company that filed a bankruptcy, non-reliance or
+        # delisting 8-K in the last 30 days (bearish ideas are still allowed)
+        red = [x for x in ((_SEC.get(str(c["ticker"]).upper()) or {}).get("red30") or []) if x in NO_LONG_ITEMS]
+        if red and c.get("direction") != "short":
+            log(f"  skip {c['ticker']}: 8-K {', '.join(f'{x} ({NO_LONG_ITEMS[x]})' for x in red)} in the last 30 days - no new longs")
+            continue
         conf = c.get("confidence", 0.0)
         htype, lean = classify_horizon(c["components"], conf)
         if alt:
@@ -2477,6 +2522,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             "plannedExitBy": (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=round(tb.HZ[hclass]["days"] * 7 / 5))).strftime("%Y-%m-%d"),
             "catalyst": cat,
             "headcount": headcount_of(c["ticker"]),             # z151: context, not scored
+            "filings": filings_of(c["ticker"]),                 # z158: 8-K flags, insiders, short selling - context
         }
         if option:
             trade.update({"instrument": "option", "optionType": option["type"], "optionStrike": option["strike"],
@@ -2913,6 +2959,14 @@ def main():
         labor = labor_context()
     except Exception as e:
         log(f"labor context failed: {e}")
+    vol_ctx = None
+    try:
+        load_filings_and_short()
+        vol_ctx = volatility_context()
+        if vol_ctx:
+            log(f"volatility (context, not scored): VIX {vol_ctx['vix']} / VIX3M {vol_ctx['vix3m']} = {vol_ctx['vixTo3m']} {vol_ctx['structure']} · SKEW {vol_ctx['skew']}")
+    except Exception as e:
+        log(f"filings / short / volatility context failed: {e}")
     # z157: the data-health monitor (TRAPP2-ANALYTICS, every 30 min) - which inputs are behind schedule
     health = None
     try:
@@ -2928,7 +2982,8 @@ def main():
             f"{labor.get('pctGrowing')} % growing, aggregate {labor.get('aggregateYoY')} % - {labor.get('read')} · headcount on file for {len(_HC)} companies")
     regime_ctx = {"regime": (rc or {}).get("regime"), "quad": (rc or {}).get("quadNowcast"),
                   "certainty": (rc or {}).get("certainty"), "dialedIn": not agnostic, "botMode": regime.get("mode"),
-                  "bondTrend": bond, "fed": fed_ctx, "curve": curve, "credit": credit, "labor": labor, "dataHealth": health}
+                  "bondTrend": bond, "fed": fed_ctx, "curve": curve, "credit": credit, "labor": labor, "dataHealth": health,
+                  "volatility": vol_ctx}
     # ex-post: mark every trade whose entry-day regime call has since been judged
     outcomes = regime_call_outcomes(rc)
     for t in trades_list(state):
