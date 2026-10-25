@@ -2913,12 +2913,22 @@ def main():
         labor = labor_context()
     except Exception as e:
         log(f"labor context failed: {e}")
+    # z157: the data-health monitor (TRAPP2-ANALYTICS, every 30 min) - which inputs are behind schedule
+    health = None
+    try:
+        hdoc = fetch_json(f"{RAW}/TRAPP2-ANALYTICS/main/data/health.json", timeout=20)
+        if isinstance(hdoc, dict):
+            health = {"asOf": hdoc.get("asOf"), "botInputsDown": hdoc.get("botInputsDown") or [], "summary": hdoc.get("summary")}
+            if health["botInputsDown"]:
+                log(f"DATA HEALTH: bot inputs behind schedule - {', '.join(health['botInputsDown'])} (recorded on trades)")
+    except Exception as e:
+        log(f"data health unavailable: {e}")
     if labor:
         log(f"labor (context, not scored): {labor.get('pctCutting')} % of {labor.get('companies')} companies cutting headcount YoY, "
             f"{labor.get('pctGrowing')} % growing, aggregate {labor.get('aggregateYoY')} % - {labor.get('read')} · headcount on file for {len(_HC)} companies")
     regime_ctx = {"regime": (rc or {}).get("regime"), "quad": (rc or {}).get("quadNowcast"),
                   "certainty": (rc or {}).get("certainty"), "dialedIn": not agnostic, "botMode": regime.get("mode"),
-                  "bondTrend": bond, "fed": fed_ctx, "curve": curve, "credit": credit, "labor": labor}
+                  "bondTrend": bond, "fed": fed_ctx, "curve": curve, "credit": credit, "labor": labor, "dataHealth": health}
     # ex-post: mark every trade whose entry-day regime call has since been judged
     outcomes = regime_call_outcomes(rc)
     for t in trades_list(state):
