@@ -9,8 +9,9 @@ name: Bot · apply app actions + Supabase sync (every 15 min)
 # hours so nothing waits for the nightly run.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '*/15 13-21 * * 1-5'     # z121: the script itself trades only in session (EDT or EST)
+  # z162: no schedule. The runner applies app actions on every pass (bot_loop.yml, every 30 min); this 15-minute
+  # schedule shared the bot-runner concurrency group and kept replacing the loop's queued next run - so the loop's
+  # self-chaining (z161) could never hold. The app still starts it on demand (workflow_dispatch) after an action.
 
 # Same group as bot-runner.yml: the two never write the state file at once.
 concurrency:
