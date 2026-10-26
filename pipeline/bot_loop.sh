@@ -54,6 +54,7 @@ one_pass() {
   fi
   if [ -n "${SUPABASE_URL:-}" ] && [ -f pipeline/sync_bot_to_supabase.py ]; then
     python pipeline/sync_bot_to_supabase.py || echo "::warning::Supabase mirror failed (book unaffected)"
+    python pipeline/sync_bot_state.py || true                 # z159: the whole journal, live, for the app
   fi
   if [ -f pipeline/bot_equity_snapshot.py ]; then
     python3 pipeline/bot_equity_snapshot.py || true
