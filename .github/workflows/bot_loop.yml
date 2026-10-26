@@ -1,6 +1,6 @@
 # ============================================================
 #  >>> DESTINATION: TheMostLocal/TRAPP2-BOT
-#  >>> FILE PATH:   .github/workflows/bot-loop.yml
+#  >>> FILE PATH:   .github/workflows/bot_loop.yml   (the name it has in the repo)
 #
 #  z144 - the bot's scheduler. Hourly triggers (at :17, off GitHub's busy :00 / :05 / :30 / :35)
 #  start a job that runs a runner pass every 30 minutes (:05 / :35 ET) for up to ~170 minutes;
@@ -22,6 +22,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write          # z161: the loop queues its own next run
 
 jobs:
   loop:
@@ -44,4 +45,5 @@ jobs:
           SUPABASE_SERVICE_ROLE:   ${{ secrets.SUPABASE_SERVICE_ROLE }}
           SUPABASE_SERVICE_KEY:    ${{ secrets.SUPABASE_SERVICE_KEY }}
           LOOP_BUDGET_MIN:         '170'
+          GH_TOKEN:                ${{ github.token }}
         run: bash pipeline/bot_loop.sh
