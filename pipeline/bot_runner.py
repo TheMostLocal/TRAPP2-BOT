@@ -79,11 +79,13 @@ RAW = f"https://raw.githubusercontent.com/{_GH_OWNER}"
 UNIVERSE_SOURCES = [
     f"{RAW}/TRAPP2/main/data/master.json",
     f"{RAW}/TRAPP2-2/main/data/master.json",
+    # z164: the macro book is scanned too - country ETFs (EWZ, EWW, EWJ ...), gold / oil ETFs, its bond ETFs.
+    # Its foreign listings stay out (session_tradable), its indices are never instruments.
+    f"{RAW}/TRAPP2-1/main/data/master.json",
 ]
 # ... and repos it only PRICES, so a position opened from any book (the app's
 # bot trades foreign listings too, e.g. 000660.KS) is marked and managed.
 PRICE_ONLY_SOURCES = [
-    f"{RAW}/TRAPP2-1/main/data/master.json",
     f"{RAW}/TRAPP2-3/main/data/master.json",
 ]
 HISTORY_BASE = {
@@ -281,10 +283,14 @@ _SUBUNIT = {"USX": ("USD", 0.01), "USd": ("USD", 0.01),
             "ILA": ("ILS", 0.01), "ILa": ("ILS", 0.01)}
 
 
+FX_ASOF = {"at": None}
+
+
 def load_fx():
     """USD-per-unit map from TRAPP2-1/data/fx/rates.json (the file the app uses)."""
     d = fetch_json(FX_URL)
     rates = (d.get("rates") if isinstance(d, dict) else {}) or {}
+    FX_ASOF["at"] = d.get("updatedAt") if isinstance(d, dict) else None
     out = {"USD": 1.0}
     for ccy, v in rates.items():
         try:
@@ -372,6 +378,9 @@ def load_universe():
     if no_rate:
         log(f"  {len(no_rate)} skipped - no FX rate: "
             + ", ".join(f"{t}({c})" for t, c in sorted(no_rate.items())[:10]))
+    n_fx = add_fx_instruments(rows, fx)                      # z164: currencies as USD-priced instruments
+    if n_fx:
+        log(f"  {n_fx} currencies tradable as FX:<CCY> (USD per unit, rates of {FX_ASOF.get('at')})")
     return rows
 
 
@@ -421,8 +430,52 @@ def _f(v):
         return None
 
 
+# z164: currencies as instruments. FX:<CCY> is priced in USD per one unit of the currency (from the FX loop's
+# rates, refreshed every 15 min), so a position's size is a number of currency units and its P&L is in dollars
+# like any share position. Long FX:BRL = the real rises against the dollar; short = it falls.
+FX_HISTORY = {}     # FX:CCY -> (pair, invert) - which TRAPP2-1 history file, and whether to invert its rate
+
+
+def fx_history_source(ccy):
+    for pair, inv in ((f"{ccy}USD=X", False), (f"{ccy}=X", True), (f"USD{ccy}=X", True)):
+        yield pair, inv
+
+
+def add_fx_instruments(rows, fx):
+    n = 0
+    for ccy in alt_research.FX_TRADABLE:
+        up = fx.get(ccy)
+        t = f"FX:{ccy}"
+        if not up or t in rows:
+            continue
+        rows[t] = {"ticker": t, "price": round(up, 8), "priceLocal": up, "currency": "USD", "fxRate": 1.0, "scan": True,
+                   "asOf": FX_ASOF.get("at"), "assetClass": "fx", "sector": "Currencies", "name": f"{ccy} (USD per {ccy})",
+                   "repo": "TRAPP2-1", "changepct": None, "beta": None}
+        n += 1
+    return n
+
+
 def load_history(ticker, repo):
     """Daily closes [{date, close}] for a ticker, newest last. None if absent."""
+    if str(ticker).upper().startswith("FX:"):
+        ccy = str(ticker).upper()[3:]
+        base = HISTORY_BASE.get("TRAPP2-1")
+        for pair, inv in fx_history_source(ccy):
+            data = fetch_json(f"{base}/{pair}.json", timeout=30)
+            if not isinstance(data, list) or len(data) < 30:
+                continue
+            closes = []
+            for bar in data:
+                try:
+                    c = float(bar.get("close") if bar.get("close") is not None else bar.get("price"))
+                except (TypeError, ValueError):
+                    continue
+                if c and c > 0:
+                    closes.append(1.0 / c if inv else c)
+            if len(closes) >= 30:
+                FX_HISTORY[ticker] = (pair, inv)
+                return closes
+        return None
     base = HISTORY_BASE.get(repo)
     if not base:
         return None
@@ -2200,7 +2253,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
            "opt_market": opt_market, "fed": fed, "grades": grades, "research": research,
            "patterns": patterns, "regime_agnostic": not (regime_ctx or {}).get("dialedIn", False)}
     pat_seen = {"aligned": 0, "nudged": 0, "overruled": 0}
-    alt_seen = {"crypto": 0, "future": 0}
+    alt_seen = {"crypto": 0, "future": 0, "fx": 0, "bond": 0, "country": 0}
     alt_rejects = {}
     alt_detail = []
 
@@ -2310,7 +2363,8 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             f"{pat_seen['nudged']} nudged over the bar · {pat_seen['overruled']} strong patterns overruled by the other factors")
     n_alt_pass = sum(1 for c in candidates if c.get("alt"))
     if sum(alt_seen.values()):
-        log(f"  alt research: {alt_seen['crypto']} crypto + {alt_seen['future']} futures scanned · "
+        log(f"  alt research: {alt_seen['crypto']} crypto + {alt_seen['future']} futures + {alt_seen['fx']} currencies + "
+            f"{alt_seen['bond']} bond ETFs + {alt_seen['country']} country ETFs scanned · "
             f"{n_alt_pass} passed the research gate"
             + (" · rejected: " + ", ".join(f"{k} {v}" for k, v in sorted(alt_rejects.items(), key=lambda x: -x[1]))
                if alt_rejects else ""))
@@ -2731,8 +2785,8 @@ def session_tradable(ticker):
     t = (ticker or "").upper()
     if not t or t.startswith("^") or t.endswith("=X"):
         return False
-    if t.endswith("-USD") or t.endswith("=F"):
-        return True
+    if t.endswith("-USD") or t.endswith("=F") or t.startswith("FX:"):
+        return True                     # z164: FX:<CCY> - currencies trade around the clock on weekdays
     return "." not in t or t.endswith(_AMERICAS)
 
 
