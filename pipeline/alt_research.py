@@ -51,11 +51,13 @@ VETO = -0.50                   # any single component this far against = no trad
 NEWS_VETO = -0.30              # news this far against (>= 2 headlines) = no trade
 EXIT_FLIP = -0.25              # held position: research this far against = exit
 WEIGHTS = {"drivers": 0.30, "supplyChain": 0.25, "news": 0.20, "regime": 0.15, "seasonality": 0.10}
-MAX_OPEN = {"crypto": 3, "future": 5} if EXPLORE else {"crypto": 2, "future": 3}
+MAX_OPEN = ({"crypto": 3, "future": 5, "fx": 4, "bond": 3, "country": 3} if EXPLORE
+            else {"crypto": 2, "future": 3, "fx": 3, "bond": 2, "country": 2})            # z164: + currencies, bond / country ETFs
 MAX_PER_GROUP = 2 if EXPLORE else 1    # futures complexes (energy, grains, ...)
-SIZE_MULT = {"crypto": 0.5, "future": 0.6}
-TARGET_DAILY_VOL = {"crypto": 0.025, "future": 0.015}
-STOP_RULE = {"crypto": (2.5, 0.10, 0.22), "future": (2.0, 0.05, 0.12)}   # k*sigma*sqrt(10), clamp
+SIZE_MULT = {"crypto": 0.5, "future": 0.6, "fx": 0.8, "bond": 0.8, "country": 0.7}
+TARGET_DAILY_VOL = {"crypto": 0.025, "future": 0.015, "fx": 0.006, "bond": 0.008, "country": 0.015}
+STOP_RULE = {"crypto": (2.5, 0.10, 0.22), "future": (2.0, 0.05, 0.12),                 # k*sigma*sqrt(10), clamp
+             "fx": (2.0, 0.015, 0.05), "bond": (2.0, 0.02, 0.06), "country": (2.0, 0.04, 0.10)}
 NEWS_WINDOW_DAYS = 14
 NEWS_HALF_LIFE_DAYS = 3.0
 
@@ -227,19 +229,104 @@ CRYPTO_KEYWORDS = {
 }
 
 
+BOND_ETFS = {"TLT", "IEF", "SHY", "TIP", "AGG", "BND", "BNDX", "GOVT"}          # duration: rates drive them
+CREDIT_ETFS = {"LQD", "HYG", "JNK", "EMB"}                                       # credit: spreads and risk appetite
+COUNTRY_ETFS = {"EWZ": "BRL", "EWW": "MXN", "EWJ": "JPY", "EWG": "EUR", "EWY": "KRW", "EWC": "CAD", "INDA": "INR",
+                "FXI": "CNY", "MCHI": "CNY", "VWO": None}
+
+
 def asset_class(ticker, row=None):
-    """'crypto' | 'future' | None (equity / FX / index - not handled here)."""
+    """'crypto' | 'future' | 'fx' | 'bond' | 'country' | None (single stocks and indices - not handled here).
+    z164: currencies (FX:<CCY>, priced in USD per unit), bond / credit ETFs and country ETFs get a research
+    case like futures - no earnings or filings, so price alone isn't a thesis."""
     t = (ticker or "").upper()
     ac = str((row or {}).get("assetClass") or (row or {}).get("asset_class") or "").lower()
+    if t.startswith("FX:") or ac == "fx":
+        return "fx"
     if t.endswith("=F") or ac == "future":
         return "future"
     if ac == "crypto" or re.fullmatch(r"[A-Z0-9]{2,10}-USD", t):
         return "crypto"
+    if t in BOND_ETFS or t in CREDIT_ETFS:
+        return "bond"
+    if t in COUNTRY_ETFS:
+        return "country"
     return None
+
+
+# ---- z164: currencies (USD per unit: long = the currency rises against the dollar) ----------------------
+_FX_EVENTS = {"rate hike": +1, "hawkish": +1, "intervention": +1, "inflows": +1, "upgrade": +1, "surplus": +1,
+              "rate cut": -1, "dovish": -1, "fiscal": -1, "deficit": -1, "default": -1, "devaluation": -1,
+              "capital controls": -1, "downgrade": -1, "outflows": -1, "crisis": -1, "selloff": -1, "sell-off": -1}
+_FX_DOLLAR = [("UUP", -1, "the dollar index (UUP)"), (("macro", "y2_chg"), -1, "US 2-year yield (dollar carry)")]
+_FX_RISK = [("^VIX", -1, "risk-off lifts the dollar"), ("SPY", +1, "risk appetite")]
+_FX_REGIME_RISK = {1: +0.4, 2: +0.2, 3: -0.2, 4: -0.5}          # risk currencies: Goldilocks / Reflation help, Deflation hurts
+_FX_REGIME_HAVEN = {1: -0.2, 2: -0.3, 3: +0.1, 4: +0.5}         # yen / franc: the reverse
+FX_PROFILES = {
+    "BRL": {"chain": [("EWZ", +1, "Brazil equities (EWZ)"), ("^BVSP", +1, "Ibovespa"), ("VALE", +1, "iron ore (VALE)"), ("CL=F", +1, "oil"), ("EMB", +1, "EM sovereign bonds")],
+            "keywords": ["brazil", "brazilian", "real", "brl", "lula", "copom", "selic", "haddad", "banco central do brasil", "petrobras", "ibovespa", "bovespa"], "haven": False},
+    "MXN": {"chain": [("EWW", +1, "Mexico equities (EWW)"), ("CL=F", +1, "oil"), ("EMB", +1, "EM sovereign bonds")],
+            "keywords": ["mexico", "mexican", "peso", "mxn", "banxico", "sheinbaum", "nearshoring", "tariff"], "haven": False},
+    "EUR": {"chain": [("^STOXX50E", +1, "euro-area equities"), ("EWG", +1, "Germany (EWG)")],
+            "keywords": ["euro", "eur", "ecb", "eurozone", "euro area", "lagarde", "bund"], "haven": False},
+    "GBP": {"chain": [("^FTSE", +1, "UK equities")], "keywords": ["pound", "sterling", "gbp", "bank of england", "boe", "gilt", "gilts"], "haven": False},
+    "JPY": {"chain": [("EWJ", -1, "Japan equities (a weaker yen lifts them)"), ("^N225", -1, "Nikkei")],
+            "keywords": ["yen", "jpy", "bank of japan", "boj", "ueda", "japan"], "haven": True},
+    "CHF": {"chain": [("GLD", +1, "gold (haven demand)")], "keywords": ["franc", "chf", "swiss", "snb", "swiss national bank"], "haven": True},
+    "AUD": {"chain": [("HG=F", +1, "copper"), ("FXI", +1, "China equities")], "keywords": ["australian dollar", "aussie", "aud", "rba", "australia", "iron ore"], "haven": False},
+    "NZD": {"chain": [("HG=F", +1, "copper"), ("FXI", +1, "China equities")], "keywords": ["new zealand", "kiwi", "nzd", "rbnz"], "haven": False},
+    "CAD": {"chain": [("CL=F", +1, "oil"), ("EWC", +1, "Canada equities (EWC)")], "keywords": ["canadian dollar", "loonie", "cad", "bank of canada", "boc", "canada"], "haven": False},
+    "CNY": {"chain": [("FXI", +1, "China equities (FXI)"), ("MCHI", +1, "China equities (MCHI)"), ("HG=F", +1, "copper")],
+            "keywords": ["yuan", "renminbi", "cny", "pboc", "people's bank of china", "china"], "haven": False},
+    "INR": {"chain": [("INDA", +1, "India equities (INDA)"), ("CL=F", -1, "oil (India imports it)")], "keywords": ["rupee", "inr", "reserve bank of india", "rbi", "india"], "haven": False},
+    "KRW": {"chain": [("EWY", +1, "Korea equities (EWY)"), ("HG=F", +1, "copper")], "keywords": ["won", "krw", "bank of korea", "korea", "kospi"], "haven": False},
+    "ZAR": {"chain": [("GLD", +1, "gold"), ("EMB", +1, "EM sovereign bonds")], "keywords": ["rand", "zar", "south africa", "sarb"], "haven": False},
+}
+FX_TRADABLE = tuple(FX_PROFILES)
+
+# ---- z164: bond ETFs and country ETFs ----------------------------------------------------------------------
+_CREDIT = {
+    "group": "credit", "seasonality": False,
+    "drivers": [("SPY", +1, "risk appetite"), ("^VIX", -1, "volatility (spreads widen with it)"), (("macro", "y10_chg"), -1, "10y yield")],
+    "chain": [("HYG", +1, "high-yield flows"), ("LQD", +1, "investment-grade flows")],
+    "keywords": ["credit", "high yield", "high-yield", "junk", "spreads", "default", "defaults", "downgrade", "bond market", "corporate bonds"],
+    "events": {"default": -1, "defaults": -1, "downgrade": -1, "spreads widen": -1, "credit crunch": -1, "bankruptcy": -1,
+               "upgrade": +1, "spreads tighten": +1, "rate cut": +1, "soft landing": +1},
+    "regime": {1: +0.4, 2: +0.2, 3: -0.3, 4: -0.4},
+}
+
+
+def _country_profile(t):
+    ccy = COUNTRY_ETFS.get(t)
+    fxp = FX_PROFILES.get(ccy) if ccy else None
+    kw = list((fxp or {}).get("keywords") or []) or ["emerging markets", "emerging-market", "em equities"]
+    chain = [c for c in ((fxp or {}).get("chain") or []) if c[0] != t] or [("EMB", +1, "EM sovereign bonds")]
+    return {"group": "country", "seasonality": False, "drivers": list(_FX_DOLLAR) + list(_FX_RISK), "chain": chain,
+            "keywords": kw, "events": dict(_FX_EVENTS), "regime": dict(_FX_REGIME_RISK)}
+
+
+def _fx_profile(ccy):
+    p = FX_PROFILES.get(ccy)
+    if not p:
+        return None
+    haven = p.get("haven")
+    drivers = list(_FX_DOLLAR) + ([("^VIX", +1, "haven demand"), ("SPY", -1, "risk appetite (a haven falls with it)")] if haven else list(_FX_RISK))
+    return {"group": "fx", "seasonality": False, "drivers": drivers, "chain": list(p["chain"]), "keywords": list(p["keywords"]) + [ccy.lower()],
+            "events": dict(_FX_EVENTS), "regime": dict(_FX_REGIME_HAVEN if haven else _FX_REGIME_RISK)}
 
 
 def profile_for(ticker, row=None):
     cls = asset_class(ticker, row)
+    t = (ticker or "").upper()
+    if cls == "fx":
+        return cls, _fx_profile(t.split(":", 1)[1] if ":" in t else t[:3])
+    if cls == "bond":
+        if t in CREDIT_ETFS:
+            peers = [("HYG", +1, "high-yield flows"), ("JNK", +1, "high-yield flows"), ("LQD", +1, "investment-grade flows"), ("EMB", +1, "EM sovereign credit")]
+            return cls, dict(_CREDIT, chain=[c for c in peers if c[0] != t])
+        return cls, dict(_RATES, chain=[c for c in _RATES["chain"] + [("GOVT", +1, "Treasury flows"), ("IEF", +1, "intermediate Treasuries")] if c[0] != t])
+    if cls == "country":
+        return cls, _country_profile(t)
     if cls == "crypto":
         base = (ticker or "").upper().split("-")[0]
         kw = CRYPTO_KEYWORDS.get(base, [base.lower()])
