@@ -46,6 +46,7 @@ one_pass() {
     || { echo "::error::bankroll missing or not numeric - not committing"; git checkout -q -- data 2>/dev/null; return 0; }
   git add -A data/bot_training_data.json                       # z116: one path per git add
   git add -A data/app_actions/ 2>/dev/null || true
+  git add data/corporate_actions.json 2>/dev/null || true      # z166: splits / dividends cache
   if ! git diff --staged --quiet; then
     git commit -q -m "Bot run $(date -u +%Y-%m-%dT%H:%M:%SZ)"   # no [skip ci]: supabase-sync.yml keys off this push
     push_retry
