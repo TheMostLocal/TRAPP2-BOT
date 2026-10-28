@@ -90,15 +90,24 @@ def trim_total(t):
     return sum(float(x.get("realized") or 0) for x in trim_events(t))
 
 
+def dividend_total(t, asof=None):
+    """z166 - dividends booked on a trade (long: income, short: paid), optionally only those with an
+    ex-date on or before `asof`. Income - never part of the exit P/L, so the entry / exit arithmetic holds."""
+    d = str(asof or "")[:10]
+    return sum(float(x.get("amount") or 0) for x in (t.get("dividends") or [])
+               if isinstance(x, dict) and (not d or str(x.get("exDate") or "")[:10] <= d))
+
+
 def ledger_bankroll(state, start):
-    """start + capital in/out + every trim + every closed trade's exit P/L.
+    """start + capital in/out + every trim + every closed trade's exit P/L + dividends (z166).
     Same rule as the app (botLedgerBankroll) - so both always agree."""
     trades = state.get("trades") or []
     capital = sum(float(x.get("amount") or 0) for x in (state.get("transactions") or [])
                   if x.get("type") in CAPITAL_TYPES)
     trims = sum(trim_total(t) for t in trades)
     closed = sum(exit_realized(t) for t in trades if t.get("status") == "closed")
-    return round(start + capital + trims + closed, 2)
+    divs = sum(dividend_total(t) for t in trades)
+    return round(start + capital + trims + closed + divs, 2)
 
 
 def ledger_asof(state, start, asof, exclude_ids=()):
@@ -117,6 +126,7 @@ def ledger_asof(state, start, asof, exclude_ids=()):
                 real += float(x.get("realized") or 0)
         if t.get("status") == "closed" and t.get("exitDate") and str(t["exitDate"])[:10] <= d:
             real += exit_realized(t)
+        real += dividend_total(t, d)                     # z166
     return round(start + cap + real, 2)
 
 
