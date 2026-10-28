@@ -1,0 +1,833 @@
+{
+ "tickers": {
+  "PLCE": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:52+00:00"
+  },
+  "CCJ": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-01",
+     "amount": 0.172
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:52+00:00"
+  },
+  "UPS": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-17",
+     "amount": 1.64
+    },
+    {
+     "exDate": "2026-02-17",
+     "amount": 1.64
+    },
+    {
+     "exDate": "2026-05-18",
+     "amount": 1.64
+    },
+    {
+     "exDate": "2026-08-17",
+     "amount": 1.64
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:53+00:00"
+  },
+  "BZFD": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:53+00:00"
+  },
+  "NOC": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-01",
+     "amount": 2.31
+    },
+    {
+     "exDate": "2026-02-23",
+     "amount": 2.31
+    },
+    {
+     "exDate": "2026-06-01",
+     "amount": 2.47
+    },
+    {
+     "exDate": "2026-08-31",
+     "amount": 2.47
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:53+00:00"
+  },
+  "PEG": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-10",
+     "amount": 0.63
+    },
+    {
+     "exDate": "2026-03-10",
+     "amount": 0.67
+    },
+    {
+     "exDate": "2026-06-09",
+     "amount": 0.67
+    },
+    {
+     "exDate": "2026-09-09",
+     "amount": 0.67
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:53+00:00"
+  },
+  "ZF=F": {
+   "splits": [],
+   "dividends": [],
+   "currency": null,
+   "fetchedAt": "2026-10-28T18:22:53+00:00"
+  },
+  "FSLR": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:53+00:00"
+  },
+  "SBLK": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-05",
+     "amount": 0.11
+    },
+    {
+     "exDate": "2026-03-09",
+     "amount": 0.37
+    },
+    {
+     "exDate": "2026-06-12",
+     "amount": 0.5
+    },
+    {
+     "exDate": "2026-08-21",
+     "amount": 0.9
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:53+00:00"
+  },
+  "EU": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:54+00:00"
+  },
+  "AAL": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:54+00:00"
+  },
+  "UMC": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2026-07-08",
+     "amount": 0.412
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:54+00:00"
+  },
+  "DELL": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2026-01-20",
+     "amount": 0.525
+    },
+    {
+     "exDate": "2026-04-21",
+     "amount": 0.63
+    },
+    {
+     "exDate": "2026-07-21",
+     "amount": 0.63
+    },
+    {
+     "exDate": "2026-10-20",
+     "amount": 0.63
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:54+00:00"
+  },
+  "TOELY": {
+   "splits": [
+    {
+     "exDate": "2026-10-07",
+     "ratio": 5.0,
+     "label": "5-for-1"
+    }
+   ],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:54+00:00"
+  },
+  "000660.KS": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-26",
+     "amount": 375.0
+    },
+    {
+     "exDate": "2026-02-25",
+     "amount": 1875.0
+    },
+    {
+     "exDate": "2026-05-27",
+     "amount": 375.0
+    },
+    {
+     "exDate": "2026-08-27",
+     "amount": 375.0
+    }
+   ],
+   "currency": "KRW",
+   "fetchedAt": "2026-10-28T18:22:54+00:00"
+  },
+  "000725.SZ": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2026-06-17",
+     "amount": 0.056
+    }
+   ],
+   "currency": "CNY",
+   "fetchedAt": "2026-10-28T18:22:55+00:00"
+  },
+  "MU": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-29",
+     "amount": 0.115
+    },
+    {
+     "exDate": "2026-03-30",
+     "amount": 0.15
+    },
+    {
+     "exDate": "2026-07-06",
+     "amount": 0.15
+    },
+    {
+     "exDate": "2026-10-14",
+     "amount": 0.15
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:55+00:00"
+  },
+  "ARM": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:55+00:00"
+  },
+  "BCAB": {
+   "splits": [
+    {
+     "exDate": "2026-04-06",
+     "ratio": 0.02,
+     "label": "1-for-50"
+    }
+   ],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:55+00:00"
+  },
+  "ZR=F": {
+   "splits": [],
+   "dividends": [],
+   "currency": null,
+   "fetchedAt": "2026-10-28T18:22:55+00:00"
+  },
+  "INDO": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:55+00:00"
+  },
+  "3231.TW": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2026-07-07",
+     "amount": 5.500623
+    }
+   ],
+   "currency": "TWD",
+   "fetchedAt": "2026-10-28T18:22:55+00:00"
+  },
+  "TSM": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-11",
+     "amount": 0.835
+    },
+    {
+     "exDate": "2026-03-17",
+     "amount": 0.956
+    },
+    {
+     "exDate": "2026-06-11",
+     "amount": 0.955
+    },
+    {
+     "exDate": "2026-09-16",
+     "amount": 1.107
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:56+00:00"
+  },
+  "LNVGY": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2026-08-06",
+     "amount": 0.86
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:56+00:00"
+  },
+  "OXY": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-10",
+     "amount": 0.24
+    },
+    {
+     "exDate": "2026-03-10",
+     "amount": 0.26
+    },
+    {
+     "exDate": "2026-06-10",
+     "amount": 0.26
+    },
+    {
+     "exDate": "2026-09-10",
+     "amount": 0.28
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:56+00:00"
+  },
+  "PARA": {
+   "splits": [
+    {
+     "exDate": "2026-05-08",
+     "ratio": 0.05,
+     "label": "1-for-20"
+    },
+    {
+     "exDate": "2026-10-27",
+     "ratio": 0.1,
+     "label": "1-for-10"
+    }
+   ],
+   "dividends": [
+    {
+     "exDate": "2025-12-18",
+     "amount": 10.0
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:56+00:00"
+  },
+  "SOS": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:56+00:00"
+  },
+  "MPC": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-19",
+     "amount": 1.0
+    },
+    {
+     "exDate": "2026-02-18",
+     "amount": 1.0
+    },
+    {
+     "exDate": "2026-05-20",
+     "amount": 1.0
+    },
+    {
+     "exDate": "2026-08-19",
+     "amount": 1.0
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:57+00:00"
+  },
+  "VLO": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-20",
+     "amount": 1.13
+    },
+    {
+     "exDate": "2026-02-05",
+     "amount": 1.2
+    },
+    {
+     "exDate": "2026-05-21",
+     "amount": 1.2
+    },
+    {
+     "exDate": "2026-07-31",
+     "amount": 1.2
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:57+00:00"
+  },
+  "PSX": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-17",
+     "amount": 1.2
+    },
+    {
+     "exDate": "2026-02-23",
+     "amount": 1.27
+    },
+    {
+     "exDate": "2026-05-18",
+     "amount": 1.27
+    },
+    {
+     "exDate": "2026-08-18",
+     "amount": 1.27
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:57+00:00"
+  },
+  "SHEL": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-14",
+     "amount": 0.716
+    },
+    {
+     "exDate": "2026-02-20",
+     "amount": 0.744
+    },
+    {
+     "exDate": "2026-05-22",
+     "amount": 0.7812
+    },
+    {
+     "exDate": "2026-08-14",
+     "amount": 0.7812
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:57+00:00"
+  },
+  "EOG": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2026-01-16",
+     "amount": 1.02
+    },
+    {
+     "exDate": "2026-04-16",
+     "amount": 1.02
+    },
+    {
+     "exDate": "2026-07-17",
+     "amount": 1.02
+    },
+    {
+     "exDate": "2026-10-16",
+     "amount": 1.02
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:57+00:00"
+  },
+  "ACN": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2026-04-09",
+     "amount": 1.63
+    },
+    {
+     "exDate": "2026-07-09",
+     "amount": 1.63
+    },
+    {
+     "exDate": "2026-10-13",
+     "amount": 1.71
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:57+00:00"
+  },
+  "COP": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-17",
+     "amount": 0.84
+    },
+    {
+     "exDate": "2026-02-18",
+     "amount": 0.84
+    },
+    {
+     "exDate": "2026-05-11",
+     "amount": 0.84
+    },
+    {
+     "exDate": "2026-08-17",
+     "amount": 0.84
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:58+00:00"
+  },
+  "NEM": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-26",
+     "amount": 0.25
+    },
+    {
+     "exDate": "2026-03-03",
+     "amount": 0.26
+    },
+    {
+     "exDate": "2026-05-27",
+     "amount": 0.26
+    },
+    {
+     "exDate": "2026-09-03",
+     "amount": 0.26
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:58+00:00"
+  },
+  "CVX": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-18",
+     "amount": 1.71
+    },
+    {
+     "exDate": "2026-02-17",
+     "amount": 1.78
+    },
+    {
+     "exDate": "2026-05-19",
+     "amount": 1.78
+    },
+    {
+     "exDate": "2026-08-19",
+     "amount": 1.78
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:58+00:00"
+  },
+  "META": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-15",
+     "amount": 0.525
+    },
+    {
+     "exDate": "2026-03-16",
+     "amount": 0.525
+    },
+    {
+     "exDate": "2026-06-15",
+     "amount": 0.525
+    },
+    {
+     "exDate": "2026-09-21",
+     "amount": 0.525
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:58+00:00"
+  },
+  "SHOP": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:59+00:00"
+  },
+  "PLTR": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:59+00:00"
+  },
+  "MSFT": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-20",
+     "amount": 0.91
+    },
+    {
+     "exDate": "2026-02-19",
+     "amount": 0.91
+    },
+    {
+     "exDate": "2026-05-21",
+     "amount": 0.91
+    },
+    {
+     "exDate": "2026-08-20",
+     "amount": 0.91
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:59+00:00"
+  },
+  "SSNLF": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-29",
+     "amount": 0.421147
+    },
+    {
+     "exDate": "2026-03-30",
+     "amount": 0.276796
+    },
+    {
+     "exDate": "2026-06-29",
+     "amount": 0.278284
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:59+00:00"
+  },
+  "GME": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:59+00:00"
+  },
+  "TEAM": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:22:59+00:00"
+  },
+  "GOGO": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:23:00+00:00"
+  },
+  "TTWO": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:23:00+00:00"
+  },
+  "SPHR": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:23:00+00:00"
+  },
+  "ALXO": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:23:00+00:00"
+  },
+  "XOM": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-14",
+     "amount": 1.03
+    },
+    {
+     "exDate": "2026-02-12",
+     "amount": 1.03
+    },
+    {
+     "exDate": "2026-05-15",
+     "amount": 1.03
+    },
+    {
+     "exDate": "2026-08-17",
+     "amount": 1.03
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:23:00+00:00"
+  },
+  "BP": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-14",
+     "amount": 0.499
+    },
+    {
+     "exDate": "2026-02-20",
+     "amount": 0.499
+    },
+    {
+     "exDate": "2026-05-15",
+     "amount": 0.499
+    },
+    {
+     "exDate": "2026-08-14",
+     "amount": 0.52
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:23:00+00:00"
+  },
+  "DVN": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-15",
+     "amount": 0.24
+    },
+    {
+     "exDate": "2026-03-13",
+     "amount": 0.24
+    },
+    {
+     "exDate": "2026-06-15",
+     "amount": 0.32
+    },
+    {
+     "exDate": "2026-09-15",
+     "amount": 0.32
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:23:01+00:00"
+  },
+  "AMGN": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-21",
+     "amount": 2.38
+    },
+    {
+     "exDate": "2026-02-13",
+     "amount": 2.52
+    },
+    {
+     "exDate": "2026-05-15",
+     "amount": 2.52
+    },
+    {
+     "exDate": "2026-08-21",
+     "amount": 2.52
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:23:01+00:00"
+  },
+  "ESTC": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:23:01+00:00"
+  },
+  "OKE": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-03",
+     "amount": 1.03
+    },
+    {
+     "exDate": "2026-02-02",
+     "amount": 1.07
+    },
+    {
+     "exDate": "2026-05-04",
+     "amount": 1.07
+    },
+    {
+     "exDate": "2026-08-03",
+     "amount": 1.07
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:23:01+00:00"
+  },
+  "NVDA": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-04",
+     "amount": 0.01
+    },
+    {
+     "exDate": "2026-03-11",
+     "amount": 0.01
+    },
+    {
+     "exDate": "2026-06-04",
+     "amount": 0.25
+    },
+    {
+     "exDate": "2026-09-10",
+     "amount": 0.25
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-28T18:23:01+00:00"
+  }
+ },
+ "asOf": "2026-10-28T18:23:01+00:00"
+}
