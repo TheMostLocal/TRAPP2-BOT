@@ -58,6 +58,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import alt_research  # noqa: E402  research-driven gate for crypto & futures
+import corporate_actions as ca  # noqa: E402  z166: splits and dividends
+CA_STATE = {"store": None, "fx": None}
 import trade_book as tb  # noqa: E402  z138: horizons (short / medium / long), options, catalysts, position reviews
 
 # Repo owner — resolved at runtime so the pipeline follows the repos to any
@@ -331,6 +333,12 @@ def load_universe():
                 if v is not None and math.isfinite(v) and v > 0:
                     price = v
                     break
+            # z166: a previous close on the other side of a split (PARA 10-28: closeyest 0.425, opened 4.46 after a
+            # 1-for-10) is not a price - use today's open instead, or leave the ticker unpriced
+            if fld == "closeyest" and price:
+                op = _f(r.get("priceopen"))
+                if op and op > 0 and ca.split_like(op / price):
+                    price, fld = op, "priceopen"
             if price is None:
                 continue
             ccy = (r.get("currency") or "USD")
@@ -2013,6 +2021,34 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
                 f"({u.get('currency')}); position left untouched")
             continue
         pos.pop("markSuspect", None)
+        # z166: a one-pass jump by a split-like ratio (x10, x0.5 ...) with the market cap unchanged is a split the
+        # book hasn't applied, not a move - confirm it with Yahoo's split record now; if it can't be confirmed,
+        # freeze the position (no stop / target / trim on a price that can't be trusted) and say so every pass.
+        prev = _f(pos.get("lastPrice"))
+        if prev and px and (pos.get("instrument") or "shares") == "shares" and ca.split_like(px / prev):
+            mc_now, mc_prev = _f(u.get("marketcap")), _f(pos.get("lastMarketCap"))
+            real_move = bool(mc_now and mc_prev and not (0.6 <= mc_now / mc_prev <= 1.6))
+            if not real_move:
+                confirmed = []
+                if CA_STATE.get("store") is not None:
+                    CA_STATE["store"].get(pos.get("ticker"), force=True)
+                    confirmed = ca.process({"trades": [pos]}, CA_STATE["store"], today, restate_fn=ts.arith_exit_pl, log=log)
+                    CA_STATE["store"].save()
+                prev = _f(pos.get("lastPrice"))
+                if confirmed and prev and not ca.split_like(px / prev):
+                    log(f"  {pos.get('ticker')}: split confirmed and applied - managed on the adjusted basis")
+                else:
+                    pos["priceAnomaly"] = {"since": (pos.get("priceAnomaly") or {}).get("since") or today, "date": today,
+                                           "prev": prev, "now": px, "ratio": round(px / prev, 4) if prev else None,
+                                           "marketCapNow": mc_now, "marketCapPrev": mc_prev}
+                    msg = (f"{pos.get('ticker')} {pos.get('direction')} → FROZEN: ${prev:,.4f} → ${px:,.4f} (x{px / prev:.2f}) in one pass"
+                           + (" with the market cap unchanged" if (mc_now and mc_prev) else " with no market cap to tell")
+                           + " - a split-like jump with no split on record; no stop / target / trim until it's confirmed")
+                    log("  ! " + msg)
+                    review_lines.append(msg)
+                    continue
+        pos.pop("priceAnomaly", None)
+        pos["lastMarketCap"] = _f(u.get("marketcap"))
         pos["lastPrice"] = px
         pos["lastPriceLocal"] = u.get("priceLocal")
         direction = -1 if pos.get("direction") == "short" else 1
@@ -2875,6 +2911,19 @@ def main():
     else:
         pull_supabase_trades(state)
     app_done = apply_app_actions(state, today, sess if in_session else None, fresh)
+    ca_done = []
+    try:                                       # z166: splits (adjust / restate) and dividends, every pass
+        CA_STATE["store"] = ca.Store(STATE_FILE.parent / "corporate_actions.json")
+        CA_STATE["fx"] = load_fx()
+        for t in trades_list(state):           # a held name that jumped by a split-like ratio: ask Yahoo now
+            uu, lp = universe.get(str(t.get("ticker") or "").upper()), _f(t.get("lastPrice"))
+            if t.get("status") == "open" and uu and lp and ca.split_like(uu["price"] / lp):
+                CA_STATE["store"].get(t.get("ticker"), force=True)
+        ca_done = ca.process(state, CA_STATE["store"], today, restate_fn=ts.arith_exit_pl,
+                             fx_of=lambda c: usd_factor(c, CA_STATE["fx"]), log=log)
+        CA_STATE["store"].save()
+    except Exception as e:
+        log(f"corporate actions unavailable this pass ({type(e).__name__}: {e})")
     before = state.get("bankroll")
     reconcile_ledger(state, before, today)       # z117: pnl repair + dated opening adjustment
     state["bankroll"] = ts.ledger_bankroll(state, STARTING_BANKROLL)
@@ -2910,12 +2959,12 @@ def main():
             recompute(state, universe, today)
             _write_state(state, "after-close review of open positions (no trades)")
             return
-        if not app_done:
+        if not app_done and not ca_done:
             log("market closed - no trades; journal unchanged (nothing written)")
             return
         finalize_state(state, sig_before)
         recompute(state, universe, today)
-        _write_state(state, f"closed-market pass: {len(app_done)} bookkeeping action(s), no trades")
+        _write_state(state, f"closed-market pass: {len(app_done)} bookkeeping action(s), {len(ca_done)} corporate action(s), no trades")
         return
 
     if ACTIONS_ONLY:
