@@ -833,7 +833,59 @@
    "dividends": [],
    "currency": "USD",
    "fetchedAt": "2026-10-29T18:31:56+00:00"
+  },
+  "BWET": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-10-29T19:05:01+00:00"
+  },
+  "A": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2026-01-06",
+     "amount": 0.255
+    },
+    {
+     "exDate": "2026-03-31",
+     "amount": 0.255
+    },
+    {
+     "exDate": "2026-06-30",
+     "amount": 0.255
+    },
+    {
+     "exDate": "2026-10-06",
+     "amount": 0.255
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-29T19:05:01+00:00"
+  },
+  "PFE": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-07",
+     "amount": 0.43
+    },
+    {
+     "exDate": "2026-01-23",
+     "amount": 0.43
+    },
+    {
+     "exDate": "2026-05-08",
+     "amount": 0.43
+    },
+    {
+     "exDate": "2026-07-24",
+     "amount": 0.43
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-10-29T19:05:01+00:00"
   }
  },
- "asOf": "2026-10-29T18:31:56+00:00"
+ "asOf": "2026-10-29T19:05:01+00:00"
 }
