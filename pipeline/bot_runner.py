@@ -823,6 +823,17 @@ def load_catalysts():
     return _CAL
 _OPT_MARKET = {"done": False, "data": None}
 
+_OPT_SUMMARY = {"doc": None}
+
+
+def _opt_summary_row(ticker):
+    """z167: TRAPP2-OPTIONS summary row (atmIv30, ivRank ...) for the IV regime."""
+    if _OPT_SUMMARY["doc"] is None:
+        d = fetch_json(f"{OPTIONS_BASE}/summary.json", timeout=30)
+        _OPT_SUMMARY["doc"] = (d.get("tickers") if isinstance(d, dict) else None) or {}
+    return _OPT_SUMMARY["doc"].get(str(ticker).upper())
+
+
 def _load_option_chain(ticker):
     if ticker in _OPT_CACHE:
         return _OPT_CACHE[ticker]
@@ -2091,6 +2102,47 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
         in_hold = days_held < min_hold
         hc = tb.horizon_class(pos)
         cat = tb.catalyst_info(_CAL, pos.get("ticker"), today)
+        if pos.get("instrument") == "option" and pos.get("optionLegs"):
+            # z167: a vertical spread - valued leg by leg; exits by its own rules (credit: keep 50 %, stop at 2x the credit)
+            chain = _load_option_chain(pos["ticker"])
+            ed = tb._d(pos.get("optionExpiry"))
+            dte = (ed - tb._d(today)).days if ed else None
+            value, exit_v, src = tb.spread_value(pos, chain, px, today)
+            if value is None:
+                review_lines.append(tb.review(pos, today, price=px, ret=0.0, days_held=days_held, min_hold=min_hold, decision="hold",
+                                              reason="no mark for a leg this pass", score_now=signed_now, cat=cat, dte=dte))
+                continue
+            pos["optionMark"], pos["optionMarkAt"], pos["optionMarkSource"] = value, today, src
+            pos["pnl"] = tb.spread_pnl(pos, value)
+            ret_s = pos["pnl"] / (pos.get("notional") or 1)
+            pos["returnPct"] = round(ret_s * 100, 2)
+            exit_reason = tb.spread_exit(pos, value, dte, hc)
+            if exit_reason and in_hold and exit_reason != "expiry" and not exit_reason.startswith("credit-stop"):
+                exit_reason = None                              # inside the minimum hold: only expiry or a credit stop
+            if not exit_reason and not in_hold and aligned_now is not None and aligned_now <= -CORE_EXIT_SCORE:
+                exit_reason = "thesis-break"
+            if exit_reason and review_only:
+                review_lines.append(tb.review(pos, today, price=px, ret=ret_s, days_held=days_held, min_hold=min_hold, decision="flag",
+                                              reason=f"{exit_reason} - acts at the next session's first pass", score_now=signed_now, cat=cat,
+                                              mark=value, mark_src=src, dte=dte))
+                continue
+            if exit_reason:
+                settle = value if exit_reason == "expiry" else exit_v
+                r = tb.spread_pnl(pos, settle, fee_sides=2)
+                pos.update({"status": "closed", "exitDate": today, "exitPrice": px, "optionExit": round(settle, 4),
+                            "exitReason": exit_reason, "realizedPL": r, "pnl": r, "won": r > 0,
+                            "returnPct": round(r / (pos.get("notional") or 1) * 100, 2)})
+                state["bankroll"] = round(state.get("bankroll", STARTING_BANKROLL) + r, 2)
+                closed_now.append((pos["ticker"], exit_reason, r))
+                review_lines.append(tb.review(pos, today, price=px, ret=ret_s, days_held=days_held, min_hold=min_hold, decision="close",
+                                              reason=f"{exit_reason} - closed at {settle:+.2f}/sh ({src})", score_now=signed_now, cat=cat,
+                                              mark=value, mark_src=src, dte=dte))
+            else:
+                review_lines.append(tb.review(pos, today, price=px, ret=ret_s, days_held=days_held, min_hold=min_hold, decision="hold",
+                                              reason=("credit spread: keep 50 % of the credit, stop at 2x it, close a week out" if pos.get("optionCredit")
+                                                      else "debit spread: take 60 % of the maximum gain, stop at half the debit"),
+                                              score_now=signed_now, cat=cat, mark=value, mark_src=src, dte=dte))
+            continue
         if pos.get("instrument") == "option":
             chain = _load_option_chain(pos["ticker"])
             mark, bid, src = tb.option_mark(pos, chain, px, today)
@@ -2482,7 +2534,22 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                              and abs(c["components"].get("catalyst") or 0) >= 0.10)
         if not alt and (conf >= tb.OPT_CONF or cat_in_window or c.get("putOnly")) and tb.chain_fresh(chain, today):
             prem_open = sum((p.get("notional") or 0) for p in trades_list(state) if p.get("status") == "open" and p.get("instrument") == "option")
-            option, o_why = tb.pick_contract(chain, c.get("direction"), hclass, today, cat if cat_in_window else None)
+            # z167: the IV regime decides what to trade - sell premium when IV is rich, verticals in the middle,
+            # buy premium when it's cheap (defined risk everywhere: credit spreads, never naked shorts)
+            u_c = universe.get(c["ticker"].upper()) or {}
+            reg = tb.iv_regime(_opt_summary_row(c["ticker"]), load_history(c["ticker"], u_c.get("repo")) if u_c.get("repo") else None)
+            structure = tb.choose_structure(c.get("direction"), reg)
+            if structure in ("long_call", "long_put"):
+                option, o_why = tb.pick_contract(chain, c.get("direction"), hclass, today, cat if cat_in_window else None)
+            else:
+                option, o_why = tb.pick_spread(chain, structure, hclass, today, cat if cat_in_window else None)
+                if not option:
+                    log(f"  {c['ticker']}: {structure.replace('_', ' ')} not available ({o_why}) - a long {('call' if c.get('direction') == 'long' else 'put')} instead")
+                    structure = "long_call" if c.get("direction") == "long" else "long_put"
+                    option, o_why = tb.pick_contract(chain, c.get("direction"), hclass, today, cat if cat_in_window else None)
+            if option:
+                option["structure"], option["ivRegime"] = structure, reg
+                log(f"  {c['ticker']}: IV {reg.get('regime')} ({reg.get('basis')}) → {structure.replace('_', ' ')}")
             if option and prem_open >= bankroll * tb.OPT_BOOK_PCT:
                 option, o_why = None, f"option book full ({prem_open / bankroll:.1%} of the bankroll at risk)"
             if not option:
@@ -2499,17 +2566,18 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             # premium = 1.0 % → 2.5 % of the bankroll with confidence; the premium is the most it can lose
             budget = tb.option_budget(bankroll, conf, explore)        # 1 % → 2.5 %; deep conviction 4 %
             cap_now = min(budget, max(deployable, opt_room) if constrained else deployable)
-            contracts = int(cap_now // (option["ask"] * 100))
+            risk_per = (option["maxLoss"] if option.get("legs") else option["ask"]) * 100      # z167: the most one contract can lose
+            contracts = int(cap_now // risk_per)
             if contracts < 1:
-                log(f"  {c['ticker']}: one contract (${option['ask'] * 100:,.0f}) is more than the ${cap_now:,.0f} available "
+                log(f"  {c['ticker']}: one contract (${risk_per:,.0f} at risk) is more than the ${cap_now:,.0f} available "
                     f"(budget ${budget:,.0f}{f', option room left ${opt_room:,.0f}' if constrained else ''})")
                 if c.get("putOnly"):
                     continue
                 option = None
         if option:
             shares = 0
-            notional = round(contracts * option["ask"] * 100, 2)
-            fees = round(tb.OPT_FEE * contracts, 2)
+            notional = round(contracts * (option["maxLoss"] if option.get("legs") else option["ask"]) * 100, 2)   # capital at risk
+            fees = round(tb.OPT_FEE * contracts * (len(option.get("legs") or []) or 1), 2)
             opt_room -= notional
         else:
             if constrained and deployable < bankroll * 0.02:
@@ -2614,16 +2682,38 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             "headcount": headcount_of(c["ticker"]),             # z151: context, not scored
             "filings": filings_of(c["ticker"]),                 # z158: 8-K flags, insiders, short selling - context
         }
-        if option:
+        if option and option.get("legs"):
+            # z167: a vertical spread - two legs, one expiry; optionNet is the signed entry value per share
+            # (+ a debit paid, - a credit received); notional / maxLoss = the most it can lose
+            short_leg = next(l for l in option["legs"] if l["side"] == "short")
+            long_leg = next(l for l in option["legs"] if l["side"] == "long")
+            trade.update({"instrument": "option", "optionStructure": option["structure"], "optionLegs": option["legs"],
+                          "optionType": option["type"], "optionStrike": short_leg["strike"] if option["credit"] else long_leg["strike"],
+                          "optionExpiry": option["expiry"], "optionContracts": contracts, "optionNet": option["net"],
+                          "optionPremium": round(abs(option["net"]), 4), "optionCredit": bool(option["credit"]),
+                          "optionMark": round(sum((l.get("mid") or l["price"]) * (1 if l["side"] == "long" else -1) for l in option["legs"]), 4),
+                          "optionMarkAt": today, "optionDelta": option.get("delta"), "optionIV": option.get("iv"), "optionWidth": option["width"],
+                          "maxLossPerShare": option["maxLoss"], "maxGainPerShare": option["maxGain"], "breakeven": option["breakeven"],
+                          "maxGain": round(option["maxGain"] * 100 * contracts, 2), "optionChainAsOf": option.get("chainAsOf"),
+                          "ivRegime": option.get("ivRegime"), "multiplier": 100, "maxLoss": notional, "leverage": 1})
+            k_long, k_short = long_leg["strike"], short_leg["strike"]
+            trade["rationale"].append(
+                f"{option['structure'].replace('_', ' ').upper()} {option['type'].upper()}S {k_long:g}/{k_short:g} exp {option['expiry']} ({option['dte']}d) ×{contracts} · "
+                + (f"credit ${-option['net']:.2f}/sh (${-option['net'] * 100 * contracts:,.0f} received)" if option["credit"] else f"debit ${option['net']:.2f}/sh")
+                + f" · max loss ${notional:,.0f} · max gain ${option['maxGain'] * 100 * contracts:,.0f} · breakeven ${option['breakeven']:.2f}"
+                + f" · IV {option['ivRegime'].get('regime')}: {option['ivRegime'].get('basis')}")
+        elif option:
             trade.update({"instrument": "option", "optionType": option["type"], "optionStrike": option["strike"],
                           "optionExpiry": option["expiry"], "optionContracts": contracts, "optionPremium": option["ask"],
                           "optionMark": option["mid"], "optionMarkAt": today, "optionDelta": option.get("delta"),
                           "optionIV": option.get("iv"), "optionChainAsOf": option.get("chainAsOf"), "multiplier": 100,
-                          "maxLoss": notional, "leverage": 1})
+                          "optionStructure": option.get("structure") or ("long_call" if option["type"] == "call" else "long_put"),
+                          "ivRegime": option.get("ivRegime"), "maxLoss": notional, "leverage": 1})
             trade["rationale"].append(
                 f"OPTION {option['type'].upper()} {option['strike']} exp {option['expiry']} ({option['dte']}d) ×{contracts} @ ${option['ask']:.2f} ask"
                 f" · Δ {option.get('delta')} · premium ${notional:,.0f} = the most it can lose" +
-                (" · catalyst inside the horizon" if cat_in_window else f" · conviction {conf:.2f}"))
+                (" · catalyst inside the horizon" if cat_in_window else f" · conviction {conf:.2f}") +
+                (f" · IV {option['ivRegime'].get('regime')}: {option['ivRegime'].get('basis')}" if option.get("ivRegime") else ""))
         trade["rationale"].append(f"{hclass.upper()} horizon (~{tb.HZ[hclass]['days']} sessions, min hold {tb.HZ[hclass]['min_hold']}): {h_why}"
                                   + (" · exploratory size" if explore else "") +
                                   (f" · earnings {cat['date']} ({cat['days']}d, beat rate {cat.get('beatRate')})" if cat and cat.get("date") else ""))
@@ -2661,8 +2751,12 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             state["startedAt"] = today
     for tk, notional, sc in opened:
         t = next((x for x in reversed(trades_list(state)) if x.get("ticker") == tk and x.get("status") == "open"), {})
-        what = (f"{t.get('optionType', '').upper()} {t.get('optionStrike')} {t.get('optionExpiry')} ×{t.get('optionContracts')}"
-                if t.get("instrument") == "option" else f"{t.get('direction')} shares")
+        if t.get("optionLegs"):
+            what = (f"{t['optionStructure'].replace('_', ' ').upper()} {'/'.join(format(l['strike'], 'g') for l in t['optionLegs'])} "
+                    f"{t.get('optionExpiry')} ×{t.get('optionContracts')} ({'credit' if t.get('optionCredit') else 'debit'} {abs(t.get('optionNet') or 0):.2f}/sh)")
+        else:
+            what = (f"{t.get('optionType', '').upper()} {t.get('optionStrike')} {t.get('optionExpiry')} ×{t.get('optionContracts')}"
+                    if t.get("instrument") == "option" else f"{t.get('direction')} shares")
         log(f"  opened {tk} {what} · {t.get('horizonClass', '?')} · ${notional:,.0f} (score {sc:.2f})")
     return opened
 
