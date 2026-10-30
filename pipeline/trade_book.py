@@ -252,6 +252,192 @@ def option_pnl(pos, px_per_share, fee_sides=1):
     return round((px_per_share - (pos.get("optionPremium") or 0)) * 100 * c - OPT_FEE * c * fee_sides, 2)
 
 
+# ---------------------------------------------------------------- z167: the IV regime decides the structure
+# IV high (top 20 % of its own year)  -> SELL premium: credit spreads (defined risk - never naked)
+# IV middle 60 %                       -> verticals: credit spreads in the upper half of the band, debit spreads in the lower
+# IV low (bottom 20 %)                 -> BUY premium: a long call / put
+# IV rank comes from TRAPP2-OPTIONS (its stored 30-day ATM surface, once it has 20+ days); until then implied vs
+# realised volatility stands in: IV / HV20 >= 1.35 is rich, <= 0.90 is cheap.
+IV_UPPER, IV_LOWER, IV_MID_SPLIT = 80.0, 20.0, 50.0
+IVHV_RICH, IVHV_CHEAP, IVHV_MID_SPLIT = 1.35, 0.90, 1.10
+SPREADS = {
+    #  structure            leg kind   bias      long-leg delta  short-leg delta  credit?
+    "bull_call_debit":  {"kind": "call", "bias": "long",  "long": 0.55, "short": 0.30, "credit": False},
+    "bear_put_debit":   {"kind": "put",  "bias": "short", "long": 0.55, "short": 0.30, "credit": False},
+    "bull_put_credit":  {"kind": "put",  "bias": "long",  "long": 0.20, "short": 0.30, "credit": True},     # ~10-wide wings on
+    "bear_call_credit": {"kind": "call", "bias": "short", "long": 0.20, "short": 0.30, "credit": True},     # liquid names
+}
+CREDIT_DTE = (25, 50)                  # credit spreads: the theta window
+CREDIT_MIN_FRACTION = 0.20             # a credit worth at least a fifth of the width
+CREDIT_TP, CREDIT_STOP = 0.50, 2.0     # take 50 % of the credit; stop when the loss reaches 2x the credit
+DEBIT_TP = 0.60                        # take 60 % of a debit spread's maximum gain
+CREDIT_EXIT_DTE = 7                    # close credit spreads a week out (gamma, assignment)
+
+
+def realized_vol(closes, n=20):
+    c = [float(x) for x in (closes or []) if x]
+    if len(c) < n + 1:
+        return None
+    r = [math.log(c[i] / c[i - 1]) for i in range(len(c) - n, len(c)) if c[i - 1] > 0 and c[i] > 0]
+    if len(r) < n - 2:
+        return None
+    m = sum(r) / len(r)
+    return math.sqrt(sum((x - m) ** 2 for x in r) / (len(r) - 1)) * math.sqrt(252)
+
+
+def iv_regime(summary_row, closes=None):
+    """{'regime': upper|middle|lower, 'lean': credit|debit (middle only), 'basis', 'ivPct', 'ivHv', 'iv30', 'hv20'}."""
+    s = summary_row or {}
+    iv30 = s.get("atmIv30") or s.get("atmIv")
+    rk = s.get("ivRank") or {}
+    out = {"iv30": iv30, "ivPct": None, "ivHv": None, "hv20": None}
+    if rk.get("percentile") is not None and (rk.get("n") or 0) >= 20:
+        p = float(rk["percentile"])
+        out.update(ivPct=p, basis=f"IV percentile {p:.0f} of {rk['n']} days")
+        out["regime"] = "upper" if p >= IV_UPPER else ("lower" if p <= IV_LOWER else "middle")
+        out["lean"] = ("credit" if p >= IV_MID_SPLIT else "debit") if out["regime"] == "middle" else None
+        return out
+    hv = realized_vol(closes)
+    out["hv20"] = round(hv, 4) if hv else None
+    if iv30 and hv:
+        q = iv30 / hv
+        out.update(ivHv=round(q, 3), basis=f"IV {iv30:.0%} vs 20-day realised {hv:.0%} (x{q:.2f}; IV rank needs 20 days of history)")
+        out["regime"] = "upper" if q >= IVHV_RICH else ("lower" if q <= IVHV_CHEAP else "middle")
+        out["lean"] = ("credit" if q >= IVHV_MID_SPLIT else "debit") if out["regime"] == "middle" else None
+        return out
+    out.update(regime="middle", lean="debit", basis="no IV history or realised volatility - middle, debit (defined risk)")
+    return out
+
+
+def choose_structure(direction, reg):
+    up = direction == "long"
+    r = (reg or {}).get("regime") or "middle"
+    if r == "lower":
+        return "long_call" if up else "long_put"
+    if r == "upper" or (reg or {}).get("lean") == "credit":
+        return "bull_put_credit" if up else "bear_call_credit"
+    return "bull_call_debit" if up else "bear_put_debit"
+
+
+def _liquid(o):
+    bid, ask, mid = o.get("bid") or 0, o.get("ask") or 0, o.get("mid") or 0
+    if not (ask > 0 and mid > 0):
+        return False
+    if (o.get("openInterest") or 0) < MIN_OI and (o.get("volume") or 0) < MIN_VOL:
+        return False
+    return (ask - bid) <= max(0.10, MAX_SPREAD * mid)
+
+
+def pick_spread(chain, structure, hclass, today, cat=None):
+    """Two legs, one expiry: the long leg near its delta, the short leg near its delta on the right side of it.
+    Conservative fills: the long leg at the ask, the short leg at the bid. -> (spread, why)."""
+    sp = SPREADS.get(structure)
+    if not sp:
+        return None, f"unknown structure {structure}"
+    if not chain_fresh(chain, today):
+        return None, "no fresh chain"
+    t0 = _d(today)
+    lo, hi = CREDIT_DTE if sp["credit"] else HZ[hclass]["dte"]
+    after = (_d(cat["date"]) + timedelta(days=5)) if (cat and cat.get("date") and _d(cat["date"]) and not sp["credit"]) else None
+    exps = []
+    for e in chain.get("expiries") or []:
+        ed = _d(e.get("expiry"))
+        if ed and lo <= (ed - t0).days <= int(hi * 1.5) and (after is None or ed >= after):
+            exps.append(((ed - t0).days, e))
+    if not exps:
+        return None, f"no expiry {lo}-{int(hi * 1.5)} days out"
+    target = (lo + hi) / 2
+    exps.sort(key=lambda x: abs(x[0] - target))
+    kind = sp["kind"]
+    for dte, e in exps[:3]:
+        rows = [o for o in (e.get("calls" if kind == "call" else "puts") or []) if _liquid(o) and o.get("delta") is not None]
+        if len(rows) < 2:
+            continue
+        near = lambda want: min(rows, key=lambda o: abs(abs(o["delta"]) - want))
+        L, S = near(sp["long"]), near(sp["short"])
+        if L["strike"] == S["strike"]:
+            continue
+        # strike order: call debit long < short; put debit long > short; put credit short > long; call credit short < long
+        ok_order = {"bull_call_debit": L["strike"] < S["strike"], "bear_put_debit": L["strike"] > S["strike"],
+                    "bull_put_credit": S["strike"] > L["strike"], "bear_call_credit": S["strike"] < L["strike"]}[structure]
+        if not ok_order:
+            continue
+        width = abs(L["strike"] - S["strike"])
+        net = float(L["ask"]) - float(S["bid"])            # > 0 a debit, < 0 a credit
+        if sp["credit"]:
+            credit = -net
+            if credit < CREDIT_MIN_FRACTION * width:
+                continue
+            max_loss, max_gain = width - credit, credit
+            be = S["strike"] - credit if kind == "put" else S["strike"] + credit
+        else:
+            if not (0 < net < width):
+                continue
+            max_loss, max_gain = net, width - net
+            be = L["strike"] + net if kind == "call" else L["strike"] - net
+        if max_gain <= 0 or max_loss <= 0:
+            continue
+        legs = [{"type": kind, "strike": L["strike"], "side": "long", "price": round(float(L["ask"]), 4), "mid": L.get("mid"),
+                 "delta": L.get("delta"), "iv": L.get("iv")},
+                {"type": kind, "strike": S["strike"], "side": "short", "price": round(float(S["bid"]), 4), "mid": S.get("mid"),
+                 "delta": S.get("delta"), "iv": S.get("iv")}]
+        net_delta = round((L.get("delta") or 0) - (S.get("delta") or 0), 3)
+        return {"structure": structure, "type": kind, "expiry": e["expiry"], "dte": dte, "legs": legs, "net": round(net, 4),
+                "width": round(width, 4), "maxLoss": round(max_loss, 4), "maxGain": round(max_gain, 4), "breakeven": round(be, 4),
+                "credit": sp["credit"], "delta": net_delta, "iv": S.get("iv"), "chainAsOf": chain.get("asOf"), "spot": chain.get("spot")}, "ok"
+    return None, "no liquid pair of strikes at the target deltas" + (" with enough credit" if sp["credit"] else "")
+
+
+def spread_value(pos, chain, spot, today):
+    """(value per share at mids, value per share if closed now, source). Signed: long legs +, short legs -.
+    A credit spread is worth a negative amount (it costs that much to buy back)."""
+    mid_v = exit_v = 0.0
+    srcs = set()
+    for lg in pos.get("optionLegs") or []:
+        sub = {"optionType": lg["type"], "optionStrike": lg["strike"], "optionExpiry": pos.get("optionExpiry"), "optionIV": lg.get("iv") or pos.get("optionIV")}
+        m, b, src = option_mark(sub, chain, spot, today)
+        if m is None:
+            return None, None, "no mark for a leg"
+        srcs.add(src.split(" ")[0])
+        if lg["side"] == "long":
+            mid_v += m
+            exit_v += b if b is not None else m                      # sell the long leg at the bid
+        else:
+            mid_v -= m
+            exit_v -= (m + (m - (b if b is not None else m)))        # buy the short leg back at ~the ask
+    return round(mid_v, 4), round(exit_v, 4), "+".join(sorted(srcs))
+
+
+def spread_pnl(pos, value_per_share, fee_sides=1):
+    c = pos.get("optionContracts") or 0
+    n_legs = len(pos.get("optionLegs") or []) or 1
+    return round((value_per_share - (pos.get("optionNet") or 0)) * 100 * c - OPT_FEE * c * n_legs * fee_sides, 2)
+
+
+def spread_exit(pos, value, dte, hc):
+    """Exit reason for a spread at this value (per share), or None."""
+    net, c_max_gain, c_max_loss = pos.get("optionNet") or 0, pos.get("maxGainPerShare") or 0, pos.get("maxLossPerShare") or 0
+    gain = value - net                                            # per share, signed
+    if dte is not None and dte <= 0:
+        return "expiry"
+    if pos.get("optionCredit"):
+        credit = -net
+        if gain >= CREDIT_TP * credit:
+            return "credit-target (50 % of the credit kept)"
+        if -gain >= min(CREDIT_STOP * credit, 0.9 * c_max_loss):
+            return "credit-stop (loss reached 2x the credit)"
+        if dte is not None and dte <= max(CREDIT_EXIT_DTE, HZ[hc]["exit_dte"]):
+            return "time (expiry near)"
+    else:
+        if c_max_gain and gain >= DEBIT_TP * c_max_gain:
+            return "spread-target (60 % of the maximum gain)"
+        if net and -gain >= OPT_STOP * net:
+            return "spread-stop (half the debit lost)"
+        if dte is not None and dte <= HZ[hc]["exit_dte"]:
+            return "time (expiry near)"
+    return None
+
+
 # ---------------------------------------------------------------- the review
 def review(pos, today, *, price, ret, days_held, min_hold, decision, reason, score_now=None, cat=None,
            mark=None, mark_src=None, dte=None):
@@ -260,7 +446,11 @@ def review(pos, today, *, price, ret, days_held, min_hold, decision, reason, sco
     planned = pos.get("horizonDaysPlanned") or HZ[hc]["days"]
     parts = [f"{pos.get('ticker')} {pos.get('direction')}", f"{hc} (day {days_held} of ~{planned}"
              + (f", min hold {min_hold}" if days_held < min_hold else "") + ")"]
-    if pos.get("instrument") == "option":
+    if pos.get("instrument") == "option" and pos.get("optionLegs"):
+        ks = "/".join(f"{l['strike']:g}" for l in pos["optionLegs"])
+        parts.append(f"{str(pos.get('optionStructure', '')).replace('_', ' ').upper()} {ks} {str(pos.get('optionExpiry'))[:10]} ×{pos.get('optionContracts')}"
+                     + (f" · value {pos.get('optionNet'):+.2f}→{mark:+.2f}/sh" if mark is not None else "") + (f" · {dte} DTE" if dte is not None else ""))
+    elif pos.get("instrument") == "option":
         parts.append(f"{pos.get('optionType', '').upper()} {pos.get('optionStrike')} {str(pos.get('optionExpiry'))[:10]} ×{pos.get('optionContracts')}"
                      + (f" · premium ${pos.get('optionPremium'):.2f}→${mark:.2f}" if mark is not None else "") + (f" · {dte} DTE" if dte is not None else ""))
     parts.append(f"{ret * 100:+.1f}%")
