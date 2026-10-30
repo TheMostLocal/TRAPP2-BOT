@@ -270,10 +270,15 @@ def value_book(state, price_of):
         tic = (t.get("ticker") or "").upper()
         sh = _num(t.get("shares"))
         ep = _num(t.get("entryPrice"))
+        nonlin = t.get("instrument") in ("option", "leveraged_etf")
+        if nonlin and tic:
+            # z167: options carry no shares - their marked P/L is the unrealized (was skipped by the share check)
+            p = pos.setdefault(f"{tic}#{t.get('id')}", {"shares": 0.0, "cost": 0.0, "dir": 1.0, "nonlin": True, "pnl": 0.0})
+            p["pnl"] += _num(t.get("pnl")) or 0.0
+            continue
         if not tic or sh is None or sh <= 0 or ep is None:
             continue
         d = -1.0 if t.get("direction") == "short" else 1.0
-        nonlin = t.get("instrument") in ("option", "leveraged_etf")
         p = pos.setdefault(tic, {"shares": 0.0, "cost": 0.0, "dir": d, "nonlin": False, "pnl": 0.0})
         p["shares"] += sh
         p["cost"] += sh * ep
