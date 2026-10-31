@@ -91,15 +91,36 @@ next_grid_wait() {   # seconds until the next :05 or :35 (minute ≡ 5 mod 30), 
   echo "$w"
 }
 
+# z168: GitHub started only ~2 of the 11 hourly triggers a day (10-27..10-30: about 1430 and 1920 ET), so the
+# bot traded afternoons only. The loop now keeps itself alive from Monday's first start to Friday's close:
+#   ACTIVE (weekdays 0730-1730 ET)  a runner pass every 30 min (:05 / :35), as before
+#   NIGHT  (weekdays outside that)  no runner pass - the job just waits for the grid, cheaply
+#   at the time budget it queues its own next run Monday-Thursday at any hour, Friday until 1730 ET;
+#   over the weekend it stops (Monday's first start: the Supabase heartbeat, or GitHub's schedule).
+active_now() {
+  local d hm
+  d=$(TZ=America/New_York date +%u); hm=$((10#$(TZ=America/New_York date +%H%M)))
+  [ "$d" -le 5 ] && [ "$hm" -ge 730 ] && [ "$hm" -lt 1730 ]
+}
+keep_chain() {
+  local d hm
+  d=$(TZ=America/New_York date +%u); hm=$((10#$(TZ=America/New_York date +%H%M)))
+  [ "$d" -le 4 ] || { [ "$d" -eq 5 ] && [ "$hm" -lt 1730 ]; } || { [ "$d" -eq 7 ] && [ "$hm" -ge 1800 ]; }
+}
+
 i=0
 while :; do
   i=$((i + 1))
-  echo "── pass $i · $(date -u +%H:%M:%S)Z · $(TZ=America/New_York date +'%a %H:%M') ET"
-  one_pass
+  if active_now; then
+    echo "── pass $i · $(date -u +%H:%M:%S)Z · $(TZ=America/New_York date +'%a %H:%M') ET"
+    one_pass
+  else
+    echo "── $(TZ=America/New_York date +'%a %H:%M') ET · outside 0730-1730 ET on a weekday - no runner pass (keeping the chain)"
+  fi
   wait=$(next_grid_wait)
   if [ $(( $(date +%s) - START + wait + 240 )) -gt "$BUDGET" ]; then
     echo "budget reached after $i pass(es)"
-    if [ "$(TZ=America/New_York date +%u)" -le 5 ] && [ "$((10#$(TZ=America/New_York date +%H%M)))" -lt 1630 ]; then chain_next; fi
+    if keep_chain; then chain_next; else echo "weekend - not chaining (Monday's first start: heartbeat or schedule)"; fi
     break
   fi
   echo "  next pass in $(( wait / 60 )) min"
