@@ -885,7 +885,59 @@
    ],
    "currency": "USD",
    "fetchedAt": "2026-11-02T12:35:11+00:00"
+  },
+  "LLY": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-14",
+     "amount": 1.5
+    },
+    {
+     "exDate": "2026-02-13",
+     "amount": 1.73
+    },
+    {
+     "exDate": "2026-05-15",
+     "amount": 1.73
+    },
+    {
+     "exDate": "2026-08-14",
+     "amount": 1.73
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-11-02T15:11:52+00:00"
+  },
+  "REGN": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-11-20",
+     "amount": 0.88
+    },
+    {
+     "exDate": "2026-02-20",
+     "amount": 0.94
+    },
+    {
+     "exDate": "2026-05-20",
+     "amount": 0.94
+    },
+    {
+     "exDate": "2026-08-18",
+     "amount": 0.94
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-11-02T15:11:52+00:00"
+  },
+  "VRTX": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-11-02T15:11:53+00:00"
   }
  },
- "asOf": "2026-11-02T12:35:11+00:00"
+ "asOf": "2026-11-02T15:11:53+00:00"
 }
