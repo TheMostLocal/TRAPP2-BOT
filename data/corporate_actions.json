@@ -998,7 +998,80 @@
    ],
    "currency": "USD",
    "fetchedAt": "2026-11-05T12:35:15+00:00"
+  },
+  "ZSL": {
+   "splits": [
+    {
+     "exDate": "2026-02-26",
+     "ratio": 0.1,
+     "label": "1-for-10"
+    }
+   ],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-11-05T15:35:01+00:00"
+  },
+  "AZN": {
+   "splits": [
+    {
+     "exDate": "2026-02-02",
+     "ratio": 0.5,
+     "label": "1-for-2"
+    }
+   ],
+   "dividends": [
+    {
+     "exDate": "2026-02-19",
+     "amount": 2.153
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-11-05T15:35:01+00:00"
+  },
+  "IDXX": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-11-05T15:35:01+00:00"
+  },
+  "NDAQ": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-05",
+     "amount": 0.27
+    },
+    {
+     "exDate": "2026-03-16",
+     "amount": 0.27
+    },
+    {
+     "exDate": "2026-06-12",
+     "amount": 0.31
+    },
+    {
+     "exDate": "2026-09-11",
+     "amount": 0.31
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-11-05T15:35:01+00:00"
+  },
+  "DIS": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-15",
+     "amount": 0.75
+    },
+    {
+     "exDate": "2026-06-30",
+     "amount": 0.75
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-11-05T15:35:01+00:00"
   }
  },
- "asOf": "2026-11-05T12:35:15+00:00"
+ "asOf": "2026-11-05T15:35:01+00:00"
 }
