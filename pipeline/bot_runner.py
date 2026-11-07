@@ -792,15 +792,20 @@ def compute_quad_proxy(xa, regime_mode):
 
 
 def load_real_quad():
-    """Read the FRED-derived quad written by TRAPP2-1's macro-quad workflow.
-    Returns (quad:int, note:str) or (None, reason)."""
+    """Read TRAPP2-1/data/macro/quad.json. z177: its `current` is the market NOWCAST while that is fresh (else the
+    official GDP/CPI quad) - one answer all day; the official quad and whether the two agree ride along in the note
+    (the log used to call the nowcast "FRED quad"). Returns (quad:int, note:str) or (None, reason)."""
     data = fetch_json(MACRO_QUAD_URL, timeout=20)
     if isinstance(data, dict):
         cur = data.get("current") or {}
         q = cur.get("quad")
         if isinstance(q, int) and 1 <= q <= 4:
-            return q, f"FRED quad {q} ({cur.get('label','')}, as of {cur.get('asOf','?')})"
-    return None, "no FRED quad file"
+            kind = "market nowcast" if cur.get("method") == "market-nowcast" else "official GDP/CPI"
+            off = data.get("official") or data.get("officialLatest") or {}
+            agree = (data.get("agree") or {}).get("note")
+            extra = f" · official Q{off.get('quad')} as of {off.get('asOf')}" if off.get("quad") and kind != "official GDP/CPI" else ""
+            return q, f"quad {q} ({kind}, {cur.get('label','')}, as of {cur.get('asOf','?')}){extra}" + (f" · {agree}" if agree else "")
+    return None, "no quad file"
 
 
 def resolve_quad(xa, regime_mode):
@@ -1955,8 +1960,7 @@ def _review_context(state, universe, today):
     xa = compute_cross_asset()
     opt_market = compute_options_market(list(universe.keys()))
     regime = compute_regime(spy_closes, opt_market)
-    mq = fetch_json(f"{RAW}/TRAPP2-1/main/data/macro_quad.json", timeout=20)
-    quad = mq["quad"] if isinstance(mq, dict) and isinstance(mq.get("quad"), int) else resolve_quad(xa, regime.get("mode"))[0]
+    quad = resolve_quad(xa, regime.get("mode"))[0]          # z177: quad.json (macro_quad.json never existed - a 404 every pass)
     rc = load_regime_certainty()
     agnostic = not (rc and rc.get("dialedIn"))
     if agnostic:
@@ -3088,15 +3092,9 @@ def main():
     opt_market = compute_options_market(list(universe.keys()))
     regime = compute_regime(spy_closes, opt_market)
     fed = fed_expectation(today)
-    # Prefer the REAL FRED quad (macro_quad.json, written by the macro-quad
-    # workflow). Fall back to the market-implied proxy only if the file is absent.
-    quad, quad_note = None, ""
-    mq = fetch_json(f"{RAW}/TRAPP2-1/main/data/macro_quad.json", timeout=20)
-    if isinstance(mq, dict) and isinstance(mq.get("quad"), int):
-        quad = mq["quad"]
-        quad_note = f"FRED quad {quad}: {mq.get('quadName', '')}"
-    else:
-        quad, quad_note = resolve_quad(xa, regime.get("mode"))
+    # z177: TRAPP2-1/data/macro/quad.json - the market nowcast while fresh, else the official GDP/CPI quad, with the
+    # official quad and the agreement in the note. Falls back to the market-implied proxy only if the file is absent.
+    quad, quad_note = resolve_quad(xa, regime.get("mode"))
     xa_have = [k for k, v in xa.items() if v is not None]
     opt_note = ""
     if opt_market:
@@ -3177,7 +3175,7 @@ def main():
     if labor:
         log(f"labor (context, not scored): {labor.get('pctCutting')} % of {labor.get('companies')} companies cutting headcount YoY, "
             f"{labor.get('pctGrowing')} % growing, aggregate {labor.get('aggregateYoY')} % - {labor.get('read')} · headcount on file for {len(_HC)} companies")
-    regime_ctx = {"regime": (rc or {}).get("regime"), "quad": (rc or {}).get("quadNowcast"),
+    regime_ctx = {"regime": (rc or {}).get("regime"), "quad": (rc or {}).get("quadNowcast"), "quadOfficial": (rc or {}).get("quadOfficial"),
                   "certainty": (rc or {}).get("certainty"), "dialedIn": not agnostic, "botMode": regime.get("mode"),
                   "bondTrend": bond, "fed": fed_ctx, "curve": curve, "credit": credit, "labor": labor, "dataHealth": health,
                   "volatility": vol_ctx}
