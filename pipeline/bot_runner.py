@@ -89,12 +89,14 @@ UNIVERSE_SOURCES = [
 # bot trades foreign listings too, e.g. 000660.KS) is marked and managed.
 PRICE_ONLY_SOURCES = [
     f"{RAW}/TRAPP2-3/main/data/master.json",
+    f"{RAW}/TRAPP2-4/main/data/master.json",   # z178: the NYSE equities that weren't in the app - priced, not scanned
 ]
 HISTORY_BASE = {
     "TRAPP2": f"{RAW}/TRAPP2/main/data/history",
     "TRAPP2-2": f"{RAW}/TRAPP2-2/main/data/history",
     "TRAPP2-1": f"{RAW}/TRAPP2-1/main/data/history",
     "TRAPP2-3": f"{RAW}/TRAPP2-3/main/data/history",
+    "TRAPP2-4": f"{RAW}/TRAPP2-4/main/data/history",   # z178
 }
 FX_URL = f"{RAW}/TRAPP2-1/main/data/fx/rates.json"
 GRADES_URL = f"{RAW}/TRAPP2-ANALYTICS/main/data/research_grades.json"
@@ -2380,7 +2382,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         if tk.startswith("^"):
             continue
         if not u.get("scan", True):
-            continue   # price-only book (TRAPP2-1 / TRAPP2-3): managed when held, never scanned
+            continue   # price-only book (TRAPP2-3 / TRAPP2-4): managed when held, never scanned
         sc = score_symbol(tk, u, ctx)
         scanned += 1
         if sc is None:
