@@ -48,7 +48,8 @@ RAW = f"https://raw.githubusercontent.com/{_GH_OWNER}"
 MASTER = [f"{RAW}/TRAPP2/main/data/master.json",
           f"{RAW}/TRAPP2-2/main/data/master.json",
           f"{RAW}/TRAPP2-1/main/data/master.json",
-          f"{RAW}/TRAPP2-3/main/data/master.json"]  # gap-fill only (first-wins)
+          f"{RAW}/TRAPP2-3/main/data/master.json",
+          f"{RAW}/TRAPP2-4/main/data/master.json"]  # gap-fill only (first-wins); z178: + TRAPP2-4
 
 # ---- Supabase credentials (same block in every Valuatio sync script) --------
 # Picks whichever configured key is actually a SERVICE key (legacy JWT with
