@@ -430,7 +430,7 @@ class ResearchData:
             return self._hist[t]
         row = self.universe.get(t) or {}
         repos = [row.get("repo")] if row.get("repo") else []
-        repos += [r for r in ("TRAPP2", "TRAPP2-1", "TRAPP2-2", "TRAPP2-3") if r not in repos]
+        repos += [r for r in ("TRAPP2", "TRAPP2-1", "TRAPP2-2", "TRAPP2-3", "TRAPP2-4") if r not in repos]   # z178: + TRAPP2-4
         dated = None
         for repo in repos:
             data = self.fetch_json(f"{self.raw}/{repo}/main/data/history/{t}.json", timeout=30)
