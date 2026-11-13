@@ -1317,6 +1317,26 @@ LIVE_MIN_N = 15        # live calls judged before the live record counts at all
 LIVE_PRIOR_N = 60      # live calls at which live and backtest weigh equally
 
 
+def _pattern_edge(rec):
+    """z184 (patterns-v4): the edge a template's record has EARNED - its date-matched 20-bar edge when the whole
+    month-clustered 95% interval clears zero, 0 (neutral trust) when it doesn't (trustEdgePct). Older stats files
+    without it fall back to the raw edge vs the 20-year baseline."""
+    if not isinstance(rec, dict):
+        return None
+    v = rec.get("trustEdgePct")
+    return v if isinstance(v, (int, float)) else rec.get("edgeVsBaselinePct")
+
+
+def _pattern_trust(edge, rec):
+    """z184: STATUS 2 - "a template only becomes a buy/sell signal once its record shows an edge". A record carrying a
+    verdict (patterns-v4) earns trust only when EARNED (0.5 + edge/4, 0.5..1.0); UNPROVEN or HARMFUL = 0, no weight -
+    its calls keep being recorded, so it can earn its way in. Older records: the old formula (0.15..1.0, 0.5 neutral)."""
+    v = (rec or {}).get("edgeVerdict") if isinstance(rec, dict) else None
+    if v is not None:
+        return max(0.5, min(1.0, 0.5 + edge / 4.0)) if (v == "earned" and isinstance(edge, (int, float))) else 0.0
+    return max(0.15, min(1.0, 0.5 + (edge / 4.0))) if isinstance(edge, (int, float)) else 0.5
+
+
 def load_patterns(use_regime=True):
     """Recent identifications from the patterns engine + each template's
     backtest edge. -> {"by": {TICKER: [signal, ...]}, "rel": {template: 0..1}}"""
@@ -1327,14 +1347,15 @@ def load_patterns(use_regime=True):
     now = ((st.get("regimeNow") or {}).get("trend")) if use_regime else None
     rel_vol = {}
     for k, t in ((st.get("templates") or {}).items()):
-        edge = ((t or {}).get("backtest") or {}).get("edgeVsBaselinePct")
+        edge = _pattern_edge((t or {}).get("backtest") or {})
+        vrec = (t or {}).get("backtest") or {}               # z184: whose verdict governs the trust
         src = "all"
         # Regime-aware: use the template's record IN THE CURRENT MARKET REGIME
         # (SPY trend: up / mixed / down) once it has enough judged calls - a 52-week
         # breakout earns trust in up-trends and loses it in down-trends.
         rg = (((t or {}).get("byRegime") or {}).get("trend") or {}).get(now or "")
-        if rg and rg.get("usable") and isinstance(rg.get("edgeVsBaselinePct"), (int, float)):
-            edge, src = rg["edgeVsBaselinePct"], now
+        if rg and rg.get("usable") and isinstance(_pattern_edge(rg), (int, float)):
+            edge, src, vrec = _pattern_edge(rg), now, rg
         # z104: backtest -> LIVE transition. The live record (calls made since the
         # live ledger started, judged only on later bars) is the honest test. Blend
         # it in by sample size against a fixed prior weight for the backtest, so
@@ -1342,22 +1363,23 @@ def load_patterns(use_regime=True):
         # it carries half the weight) and a backtest edge that doesn't hold live
         # loses trust.
         live = (t or {}).get("live") or {}
-        ln, le = live.get("judged") or 0, live.get("edgeVsBaselinePct")
+        ln, le = live.get("judged") or 0, _pattern_edge(live)
         w = 0.0
         if ln >= LIVE_MIN_N and isinstance(le, (int, float)) and isinstance(edge, (int, float)):
             w = ln / (ln + LIVE_PRIOR_N)
             edge = (1 - w) * edge + w * le
             src = f"{src}+live{ln}"
         # earned trust: +4pp 20-day edge -> 1.0, no edge -> 0.5, negative -> floor 0.15
-        rel[k] = max(0.15, min(1.0, 0.5 + (edge / 4.0))) if isinstance(edge, (int, float)) else 0.5
+        # z184: with a patterns-v4 verdict, only an EARNED edge carries weight (unproven / harmful -> 0)
+        rel[k] = _pattern_trust(edge, vrec)
         # z103: breakout-volume split (patterns-v3) - a volume-confirmed call
         # earns the confirmed record's trust, a light-volume call the other.
         for vk, vs in (((t or {}).get("byVolume") or {}).items()):
-            ve = (vs or {}).get("edgeVsBaselinePct")
+            ve = _pattern_edge(vs or {})
             if (vs or {}).get("usable") and isinstance(ve, (int, float)):
                 if w:                                    # same live blend as the template trust
                     ve = (1 - w) * ve + w * le
-                rel_vol.setdefault(k, {})[vk] = max(0.15, min(1.0, 0.5 + (ve / 4.0)))
+                rel_vol.setdefault(k, {})[vk] = _pattern_trust(ve, vs)
         rel_src[k] = src
     by = {}
     for s in (sig.get("signals") or []):
