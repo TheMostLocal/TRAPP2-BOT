@@ -32,8 +32,11 @@ HZ = {
 }
 MIX_TARGET = {"short": 0.35, "medium": 0.40, "long": 0.25}
 OPT_CONF = 0.68                 # conviction that earns an options trade (or a catalyst inside the horizon)
-OPT_TRADE_PCT = (0.010, 0.025)  # premium per option trade: 1.0 % → 2.5 % of the bankroll with confidence
-DEEP_CONV, DEEP_PCT = 0.85, 0.04  # deep conviction (≥ 0.85): up to 4 % of the bankroll in premium - the big-money trades
+# z186: options were sized like stock (1.0 → 2.5 % of the bankroll, 4 % deep): five medium-term calls stopped at
+# -57 .. -67 % and a put credit spread lost 2.6 % of the book in one trade. A premium is the most a trade can lose,
+# so it IS the risk: 0.4 → 1.0 % with confidence, 1.5 % for deep conviction, all premium at risk <= 6 %.
+OPT_TRADE_PCT = (0.004, 0.010)  # premium per option trade: 0.4 % → 1.0 % of the bankroll with confidence
+DEEP_CONV, DEEP_PCT = 0.85, 0.015  # deep conviction (≥ 0.85): up to 1.5 % of the bankroll in premium - the big-money trades
 
 
 def option_budget(bankroll, conf, explore=False):
@@ -44,7 +47,7 @@ def option_budget(bankroll, conf, explore=False):
     if explore:
         pct = max(OPT_TRADE_PCT[0], pct * 0.7)
     return bankroll * pct
-OPT_BOOK_PCT = 0.12             # all premium at risk ≤ 12 % of the bankroll
+OPT_BOOK_PCT = 0.06             # all premium at risk ≤ 6 % of the bankroll (z186; was 12 %)
 OPT_STOP = 0.50                 # −50 % of the premium (after the minimum hold)
 OPT_FEE = 0.65                  # $ per contract per side
 MIN_OI, MIN_VOL = 50, 5         # liquidity
