@@ -61,6 +61,7 @@ import alt_research  # noqa: E402  research-driven gate for crypto & futures
 import corporate_actions as ca  # noqa: E402  z166: splits and dividends
 CA_STATE = {"store": None, "fx": None}
 import trade_book as tb  # noqa: E402  z138: horizons (short / medium / long), options, catalysts, position reviews
+import risk_book as rb  # noqa: E402  z186: risk-budgeted sizes, sector / cluster / beta caps, drawdown throttle
 
 # Repo owner — resolved at runtime so the pipeline follows the repos to any
 # GitHub account. Actions sets GITHUB_REPOSITORY_OWNER automatically;
@@ -216,10 +217,19 @@ POSITION_PCT = _envf("RUNNER_POSITION_PCT", _MODE["pos_pct"]) / 100.0
 CASH_RESERVE_PCT = _envf("RUNNER_CASH_RESERVE_PCT", _MODE["reserve"]) / 100.0
 MIN_SCORE = _envf("RUNNER_MIN_SCORE", _MODE["min_score"])
 DRY_RUN = os.environ.get("RUNNER_DRY_RUN", "") in ("1", "true", "yes")
-# Optional: allow the runner to SHORT on strongly-negative scores (off by default;
-# the runner is long-only unless you flip this). Options/leverage remain off.
-ALLOW_SHORTS = os.environ.get("RUNNER_ALLOW_SHORTS", "") in ("1", "true", "yes")
+# z186: SHORTS ON by default - owner direction §1d (10-21): "longs and shorts". Before z186 this defaulted off and
+# no workflow set it, so all 57 runner trades were long and nothing in the book could gain when its longs fell.
+# A strongly negative score (<= SHORT_SCORE, with a fired trigger) opens a short sale in a liquid, borrowable stock
+# (risk_book.shortable) or a put. Repo Variable RUNNER_ALLOW_SHORTS = 0 turns them off again.
+ALLOW_SHORTS = os.environ.get("RUNNER_ALLOW_SHORTS", "1").strip().lower() not in ("0", "false", "no", "off")
 SHORT_SCORE = -MIN_SCORE - 0.10   # a bit more conviction to short
+# z186: the blend leans long - in the 11-14 scan the 16 names at or below -0.35 were 11 penny stocks and 5 futures,
+# none of them a stock you can short; no liquid, borrowable name gets that low. So the short bar is ALSO relative:
+# a shortable stock in the bottom SHORT_PCTL of the session's scores, net bearish (<= SHORT_FLOOR) and with a bearish
+# trigger fired, qualifies - the way a long/short book shorts its weakest names, not only the broken ones.
+SHORT_PCTL = _envf("RUNNER_SHORT_PCTL", 10) / 100
+SHORT_FLOOR = _envf("RUNNER_SHORT_FLOOR", -0.15)
+SHORT_SLOTS = int(_envf("RUNNER_SHORT_SLOTS", 2))   # session slots kept for the best shorts, when there are any
 FEE_BPS = 0.0005  # ~5bps/side, matches the app's estimate
 
 
@@ -353,6 +363,7 @@ def load_universe():
                 "priceLocal": price, "currency": ccy, "fxRate": f, "scan": scan,
                 "asOf": r.get("fetched_at") if fld == "price" else None,   # z121: a close is never a live quote
                 "assetClass": r.get("asset_class"),
+                "isetf": str(r.get("isetf") or "").lower(),          # z186: funds aren't single-name shorts
                 "sector": r.get("sector") or "Unknown",
                 "name": r.get("name") or t,
                 "repo": repo,
@@ -465,8 +476,24 @@ def add_fx_instruments(rows, fx):
     return n
 
 
+_HIST = {}     # z186: (TICKER, repo) -> [(date, close)] - one fetch per ticker per pass (scan, management and risk)
+
+
 def load_history(ticker, repo):
-    """Daily closes [{date, close}] for a ticker, newest last. None if absent."""
+    """Daily closes for a ticker, newest last. None if absent."""
+    d = load_history_dated(ticker, repo)
+    return [c for _, c in d] if d else None
+
+
+def load_history_dated(ticker, repo):
+    """z186: [(date, close)] newest last (None if absent), cached for the pass."""
+    key = (str(ticker).upper(), repo)
+    if key not in _HIST:
+        _HIST[key] = _load_history_dated(ticker, repo)
+    return _HIST[key]
+
+
+def _load_history_dated(ticker, repo):
     if str(ticker).upper().startswith("FX:"):
         ccy = str(ticker).upper()[3:]
         base = HISTORY_BASE.get("TRAPP2-1")
@@ -481,7 +508,7 @@ def load_history(ticker, repo):
                 except (TypeError, ValueError):
                     continue
                 if c and c > 0:
-                    closes.append(1.0 / c if inv else c)
+                    closes.append((str(bar.get("date") or "")[:10], 1.0 / c if inv else c))
             if len(closes) >= 30:
                 FX_HISTORY[ticker] = (pair, inv)
                 return closes
@@ -502,7 +529,7 @@ def load_history(ticker, repo):
         except (TypeError, ValueError):
             continue
         if c and c > 0:
-            closes.append(c)
+            closes.append((str(bar.get("date") or "")[:10], c))
     return closes if len(closes) >= 30 else None
 
 
@@ -2221,9 +2248,14 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
             continue
         hold_disaster = tb.HZ[hc]["disaster"]
 
+        stop0 = pos.get("stopPrice")
         if htype == "core":
             if ret <= -CORE_HARD_STOP:
                 exit_reason = "hard-stop"
+            elif stop0 and ret < 0 and ((direction == 1 and px <= stop0) or (direction == -1 and px >= stop0)):
+                # z186: a stop set at entry is a FLOOR. Re-scoring a losing swing trade as "core" used to drop it to
+                # the 25 % hard stop (MPC, VLO: -8 % stops, closed at -17 %) - converting a loser into an investment.
+                exit_reason = "stop-loss"
             elif in_hold:
                 pass                                       # z138: inside the minimum hold only the hard stop can close it
             elif aligned_now is not None and aligned_now <= -CORE_EXIT_SCORE:
@@ -2283,6 +2315,10 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
                     except ValueError:
                         pass
 
+        if not exit_reason and rb.pos_loss_capped(pos, state.get("bankroll", STARTING_BANKROLL)):
+            # z186: no single name may cost the book more than RUNNER_RISK_POS_LOSS_CAP (0.75 %) - a backstop for
+            # gaps and for positions sized before the risk book
+            exit_reason = "risk-cap"
         if exit_reason and review_only:
             review_lines.append(tb.review(pos, today, price=px, ret=ret, days_held=days_held, min_hold=min_hold, decision="flag",
                                           reason=f"{exit_reason} at ${px:,.2f} - acts at the next session's first pass", score_now=signed_now, cat=cat))
@@ -2349,8 +2385,15 @@ def _alt_class_group(pos):
 
 # ----------------------------- open new trades --------------------------------
 def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad, opt_market=None, fed=None,
-                    research=None, patterns=None, regime_ctx=None):
+                    research=None, patterns=None, regime_ctx=None, risk=None):
     bankroll = state.get("bankroll", STARTING_BANKROLL)
+    book = (risk or {}).get("book")                     # z186: the risk book (None = pre-z186 sizing, tests only)
+    rscale = (risk or {}).get("scale", 1.0)
+    spy_rets = (risk or {}).get("spyRets") or {}
+    if book is not None and book.halted:
+        log(f"  risk: daily halt - the book is {((risk or {}).get('dayChange') or 0):+.2%} today (halt at -{rb.DAY_HALT:.0%}); "
+            f"no new entries this session (positions are still managed)")
+        return []
     held = {(p.get("ticker") or "").upper() for p in trades_list(state) if p.get("status") == "open"}
     n_open = len(held)
     if n_open >= MAX_POSITIONS:
@@ -2382,6 +2425,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
     # (past its minimum hold, re-scored below the entry bar this pass) may be rotated out for a clearly
     # stronger idea (+0.15 score). Before z140 the runner just sat out whenever the book was full.
     opt_room = max(0.0, cash - reserve * 0.5)
+    hedge_room = opt_room                              # z186: a short against a net-long book may use half the reserve too
     rot_pool = _rotation_pool(state, today)
     constrained = deployable < bankroll * 0.02
     rotations = 0
@@ -2395,6 +2439,9 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
 
     candidates = []
     scanned = 0
+    all_signed = []                                    # z186: the score distribution, logged - are there shorts to find?
+    bear = []                                          # z186: (signed, ticker, what happened) for every name at the short bar
+    bear_pool = []                                     # z186: tradable bearish ideas (bar applied after the scan)
     for tk, u in universe.items():
         if tk in held:
             continue
@@ -2410,12 +2457,15 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         if sc is None:
             continue
         comps, signed = sc["comps"], sc["signed"]
+        all_signed.append(signed)
         conf = compute_confidence(comps, signed)
         trigs = compute_triggers(comps, signed, TRIGGER_LEVEL)
         # Crypto & futures: no filings, earnings or research grade - price alone
         # isn't a thesis. They must clear the research gate (drivers, supply
         # chain, news, regime, seasonality) at a stricter bar.
         cls = alt_research.asset_class(tk, u)
+        if signed <= SHORT_SCORE and cls:
+            bear.append((signed, tk, f"{cls} - judged by the research gate"))
         if cls:
             alt_seen[cls] += 1
             ev = (alt_research.evaluate(tk, u, signed, quad, research, today, min_score, ALLOW_SHORTS)
@@ -2461,19 +2511,52 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                                "price": u["price"], "sector": u["sector"], "name": u["name"],
                                "priceLocal": u.get("priceLocal"), "currency": u.get("currency"), "fxRate": u.get("fxRate"),
                                "entryReason": entry_reason})
-        elif signed <= SHORT_SCORE and len(trigs) >= MIN_TRIGGERS and \
-                (ALLOW_SHORTS or tb.chain_fresh(_load_option_chain(tk), today)):
+        elif signed <= SHORT_FLOOR and len(trigs) < MIN_TRIGGERS:
+            if signed <= SHORT_SCORE:
+                bear.append((signed, tk, "no bearish trigger fired"))
+        elif signed <= SHORT_FLOOR and len(trigs) >= MIN_TRIGGERS:
             # z138: a bearish idea trades as a short sale (RUNNER_ALLOW_SHORTS) or as a put - defined risk
-            candidates.append({"ticker": tk, "score": abs(signed), "direction": "short",
-                               "components": comps, "confidence": conf, "triggers": trigs,
-                               "price": u["price"], "sector": u["sector"], "name": u["name"],
-                               "priceLocal": u.get("priceLocal"), "currency": u.get("currency"), "fxRate": u.get("fxRate"),
-                               "putOnly": not ALLOW_SHORTS})
+            # z186: shorts on by default; a short sale needs a liquid, borrowable stock (else a put, if a chain exists).
+            # Collected here; the session's short bar (absolute OR bottom decile) is applied after the scan.
+            can_short, short_why = rb.shortable(u) if ALLOW_SHORTS else (False, "shorts off")
+            if not can_short and not tb.chain_fresh(_load_option_chain(tk), today):
+                if signed <= SHORT_SCORE:
+                    bear.append((signed, tk, f"not shortable ({short_why}) and no option chain"))
+                continue
+            bear_pool.append({"ticker": tk, "score": abs(signed), "direction": "short", "signed": signed,
+                              "components": comps, "confidence": conf, "triggers": trigs,
+                              "price": u["price"], "sector": u["sector"], "name": u["name"],
+                              "priceLocal": u.get("priceLocal"), "currency": u.get("currency"), "fxRate": u.get("fxRate"),
+                              "putOnly": not can_short, "putWhy": short_why})
+    # z186: the session's short bar - the absolute bar, or the bottom SHORT_PCTL of today's scores (never above
+    # SHORT_FLOOR): the weakest names a long/short book would short, not only the broken ones
+    short_bar = SHORT_SCORE
+    if all_signed:
+        qq = sorted(all_signed)
+        short_bar = min(SHORT_FLOOR, max(SHORT_SCORE, qq[min(len(qq) - 1, int(SHORT_PCTL * len(qq)))]))
+    for bc in bear_pool:
+        if bc["signed"] <= short_bar:
+            candidates.append(bc)
+            bear.append((bc["signed"], bc["ticker"], "short candidate" if not bc["putOnly"] else f"put candidate ({bc['putWhy']})"))
+        else:
+            bear.append((bc["signed"], bc["ticker"], f"above today's short bar {short_bar:+.2f}"))
     candidates.sort(key=lambda c: c["score"], reverse=True)
     n_long = sum(1 for c in candidates if c["direction"] == "long")
     n_short = sum(1 for c in candidates if c["direction"] == "short")
-    log(f"  mode={RUNNER_MODE} regime={mode} quad={quad} · scanned {scanned} · {n_long} long"
-        f"{f' / {n_short} short' if ALLOW_SHORTS else ''} pass (min {min_score:.2f})")
+    log(f"  mode={RUNNER_MODE} regime={mode} quad={quad} · scanned {scanned} · {n_long} long / {n_short} short pass "
+        f"(min {min_score:.2f} long, {short_bar:.2f} short today{'' if ALLOW_SHORTS else ' - puts only, shorts off'})")
+    if all_signed:
+        q = sorted(all_signed)
+        pq = lambda f: q[min(len(q) - 1, int(f * len(q)))]
+        log(f"  scores: min {q[0]:+.2f} · 5% {pq(0.05):+.2f} · median {pq(0.5):+.2f} · 95% {pq(0.95):+.2f} · max {q[-1]:+.2f} · "
+            f"{sum(1 for x in q if x <= short_bar)} at or below today's short bar, {sum(1 for x in q if x >= min_score)} at or above the long bar")
+    if bear:
+        why_n = {}
+        for _, _, w in bear:
+            k = w.split(" (")[0].split(" - ")[0]
+            why_n[k] = why_n.get(k, 0) + 1
+        log("  short side: " + ", ".join(f"{k} {v}" for k, v in sorted(why_n.items(), key=lambda x: -x[1]))
+            + " · weakest: " + ", ".join(f"{tk} {sg:+.2f} ({w})" for sg, tk, w in sorted(bear)[:5]))
     if patterns:
         log(f"  pattern factor: {pat_seen['aligned']} names with a bullish pattern read · "
             f"{pat_seen['nudged']} nudged over the bar · {pat_seen['overruled']} strong patterns overruled by the other factors")
@@ -2520,6 +2603,18 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                 candidates.insert(slots - 1, best)
                 log(f"  reserved a slot for pattern-led {best['ticker']} (score {best['score']:.2f}, "
                     f"{best.get('entryReason', 'blend')})")
+    # z186: a mix of directions (owner direction §1d) - when there are short ideas, keep up to SHORT_SLOTS of the
+    # session's slots for the best of them; ranked by score alone, longs (>= +0.25) would always crowd them out
+    shorts_ranked = [c for c in candidates if c["direction"] == "short"]
+    if shorts_ranked and slots >= 3 and SHORT_SLOTS > 0:
+        want = shorts_ranked[:min(SHORT_SLOTS, len(shorts_ranked))]
+        if not all(c in candidates[:slots] for c in want):
+            for c in want:
+                candidates.remove(c)
+            pos = max(0, slots - len(want))
+            for k, c in enumerate(want):
+                candidates.insert(pos + k, c)
+            log(f"  reserved {len(want)} slot(s) for short(s): " + ", ".join(f"{c['ticker']} {-c['score']:+.2f}" for c in want))
     cell_count = {}                                            # z138: direction × horizon × instrument, this session
     for c in candidates:
         if len(opened) >= slots:
@@ -2557,6 +2652,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             hclass, h_why, steered = "short", "research-driven alt trade (tactical)", False
         cell = f"{c.get('direction')}|{hclass}"
         option = None
+        use_hedge = False
         chain = None if alt else _load_option_chain(c["ticker"])
         cat_in_window = bool(cat and cat.get("days") is not None and 1 <= cat["days"] <= tb.HZ[hclass]["days"] + 5
                              and abs(c["components"].get("catalyst") or 0) >= 0.10)
@@ -2590,9 +2686,18 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         explore = not any(tb.horizon_class(p) == hclass and p.get("direction") == c.get("direction")
                           and (p.get("instrument") == "option") == bool(option)
                           for p in trades_list(state) if p.get("status") == "open")
+        # z186: the risk book's view of this name - its volatility, beta and recent returns (clusters)
+        rets = sig = beta_v = None
+        if book is not None and not alt:
+            uu = universe.get(str(c["ticker"]).upper()) or {}
+            dated = load_history_dated(c["ticker"], uu.get("repo")) if uu.get("repo") else None
+            rets = rb.returns_by_date(dated) if dated else None
+            sig = rb.sigma(rets) if rets else None
+            beta_v = rb.beta(rets, spy_rets) if (rets and spy_rets) else None
         if option:
-            # premium = 1.0 % → 2.5 % of the bankroll with confidence; the premium is the most it can lose
-            budget = tb.option_budget(bankroll, conf, explore)        # 1 % → 2.5 %; deep conviction 4 %
+            # z186: premium 0.4 % → 1.0 % of the bankroll with confidence (deep conviction 1.5 %), times the drawdown
+            # throttle; the premium (or a spread's max loss) is the most it can lose. Was 1 % → 2.5 % (4 % deep).
+            budget = tb.option_budget(bankroll, conf, explore) * rscale
             cap_now = min(budget, max(deployable, opt_room) if constrained else deployable)
             risk_per = (option["maxLoss"] if option.get("legs") else option["ask"]) * 100      # z167: the most one contract can lose
             contracts = int(cap_now // risk_per)
@@ -2602,13 +2707,45 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                 if c.get("putOnly"):
                     continue
                 option = None
+        if option and book is not None:
+            o_risk = contracts * (option["maxLoss"] if option.get("legs") else option["ask"]) * 100
+            ok_r, why_r = book.check(c["ticker"], c["sector"], c.get("direction"), o_risk, -o_risk if is_short else o_risk,
+                                     beta_v, rets, o_risk, instrument="option")
+            if not ok_r:
+                log(f"  risk: skip {c['ticker']} option - {why_r}")
+                continue
         if option:
             shares = 0
             notional = round(contracts * (option["maxLoss"] if option.get("legs") else option["ask"]) * 100, 2)   # capital at risk
             fees = round(tb.OPT_FEE * contracts * (len(option.get("legs") or []) or 1), 2)
             opt_room -= notional
         else:
-            if constrained and deployable < bankroll * 0.02:
+            # z186: the stop this trade will carry (set below by its horizon) decides its size - the loss at the stop
+            # is the budget, not the notional
+            if alt:
+                stop_pct = alt["stopPct"]
+            elif hclass in ("short", "medium"):
+                stop_pct = tb.HZ[hclass]["stop"]
+            elif hclass == "long":
+                stop_pct = CORE_HARD_STOP
+            else:
+                stop_pct = SWING_STOP
+            ceiling = bankroll * POSITION_PCT * 1.6                          # the pre-z186 maximum stays the maximum
+            if book is not None:
+                size, risk_amt, eff_stop, size_why = rb.size_shares(bankroll, conf, stop_pct, sig, rscale, ceiling)
+                if alt:
+                    size *= alt["sizeMult"]
+                if explore and not alt:
+                    size *= 0.7
+                risk_amt = size * eff_stop
+                ok_r, why_r = book.check(c["ticker"], c["sector"], c.get("direction"), size, -size if is_short else size,
+                                         beta_v, rets, risk_amt)
+                if not ok_r:
+                    log(f"  risk: skip {c['ticker']} {c.get('direction')} - {why_r}")
+                    continue
+            # z186: a short sale against a net-long book lowers its risk - like an option, it may use half the reserve
+            use_hedge = is_short and book is not None and book.net_beta > 0 and deployable < bankroll * 0.02
+            if constrained and deployable < bankroll * 0.02 and not use_hedge:
                 # z140: shares need cash - rotate one faded position out if this idea is clearly stronger
                 if alt or rotations >= 1 or not rot_pool or c["score"] - rot_pool[0][0] < 0.15:
                     continue
@@ -2622,17 +2759,18 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                 deployable += freed
                 bankroll = state.get("bankroll", bankroll)
                 log(f"  rotated out {weak.get('ticker')} (faded {weak_al:+.2f}, realized ${weak.get('realizedPL', 0):,.2f}) → room for {c['ticker']} (score {c['score']:.2f})")
-            # Confidence-scaled sizing: 0.6x (low) → 1.4x (high), hard-capped at 1.6x base.
-            size = min(bankroll * POSITION_PCT * (0.6 + 0.8 * conf),
-                       deployable, bankroll * POSITION_PCT * 1.6)
-            if alt:
-                size *= alt["sizeMult"]    # smaller + volatility-scaled for crypto / futures
-            if explore and not alt:
-                size *= 0.7                # z138: a first trade in an empty cell is a smaller, exploratory one
-            if size < bankroll * MIN_POSITION_PCT:
+            if book is None:
+                # pre-z186: confidence-scaled sizing 0.6x (low) → 1.4x (high), hard-capped at 1.6x base
+                size = min(bankroll * POSITION_PCT * (0.6 + 0.8 * conf), deployable, ceiling)
                 if alt:
-                    continue
-                break
+                    size *= alt["sizeMult"]    # smaller + volatility-scaled for crypto / futures
+                if explore and not alt:
+                    size *= 0.7                # z138: a first trade in an empty cell is a smaller, exploratory one
+                size_why = "notional"
+            room = hedge_room if use_hedge else deployable
+            size = min(size, room)
+            if size < bankroll * MIN_POSITION_PCT:
+                continue                       # z186: too small (risk budget or cash) - the next idea may still fit (a short via the hedge room)
             shares = round(size / c["price"], 4)
             if shares <= 0:
                 continue
@@ -2671,6 +2809,11 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             horizon_days = int(SWING_HORIZON * (1 + conf))  # more confidence → longer leash
             style = "momentum"
         trigs = c.get("triggers", [])
+        if book is not None:
+            g_new, s_new = (notional, -notional if is_short else notional)
+            r_new = notional if option else notional * (eff_stop if not option else 1.0)
+            book.add(c["ticker"], c["sector"], c.get("direction"), g_new, s_new, beta_v, rets, new_risk=r_new, new=True,
+                     instrument="option" if option else "shares")
         trade = {
             "id": f"{c['ticker']}-{today}-runner-{int(datetime.now(timezone.utc).timestamp())}{'-opt' if option else ''}",
             "ticker": c["ticker"], "name": c["name"], "sector": c["sector"],
@@ -2707,6 +2850,12 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             "horizonDaysPlanned": tb.HZ[hclass]["days"], "minHoldDays": tb.HZ[hclass]["min_hold"],
             "plannedExitBy": (datetime.strptime(today, "%Y-%m-%d") + timedelta(days=round(tb.HZ[hclass]["days"] * 7 / 5))).strftime("%Y-%m-%d"),
             "catalyst": cat,
+            # z186: what the risk book decided - the loss budget, the stop it sized against, the throttle
+            "risk": ({"riskPct": round((notional if option else notional * eff_stop) / bankroll * 100, 3),
+                      "sizedBy": "premium budget" if option else size_why,
+                      "effStopPct": None if option else round(eff_stop * 100, 2),
+                      "dailyVolPct": round(sig * 100, 2) if sig else None, "beta": round(beta_v, 2) if beta_v is not None else None,
+                      "throttle": rscale} if book is not None else None),
             "headcount": headcount_of(c["ticker"]),             # z151: context, not scored
             "filings": filings_of(c["ticker"]),                 # z158: 8-K flags, insiders, short selling - context
         }
@@ -2768,6 +2917,8 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             if alt["assetClass"] == "future" and alt.get("group"):
                 open_groups[alt["group"]] = open_groups.get(alt["group"], 0) + 1
         # cash decrements on buy so the book stays consistent
+        if not option and is_short and book is not None and use_hedge:
+            hedge_room -= notional
         committed += notional
         cash -= notional
         deployable -= notional
@@ -2777,6 +2928,9 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         opened.append((c["ticker"], notional, c["score"]))
         if not state.get("startedAt"):
             state["startedAt"] = today
+    if book is not None and book.rejects:
+        log("  risk: skipped " + ", ".join(f"{k} {v}" for k, v in sorted(book.rejects.items(), key=lambda x: -x[1]))
+            + f" · new risk today {book.new_risk / max(1.0, bankroll):.2%} of the book (cap {rb.NEW_RISK_PER_DAY:.1%})")
     for tk, notional, sc in opened:
         t = next((x for x in reversed(trades_list(state)) if x.get("ticker") == tk and x.get("status") == "open"), {})
         if t.get("optionLegs"):
@@ -2924,10 +3078,89 @@ def recompute(state, universe, today):
     if spy and not state.get("benchmarkStart"):
         state["benchmarkStart"] = spy["price"]
 
+    # z186: takeaways from the journal itself (the old ones were an app export's, frozen at 8 trades)
+    tk = []
+    if win_rate is not None:
+        tk.append(f"Win rate {win_rate * 100:.1f}% over {len(wins) + len(losses)} settled trades; net P&L ${total_pnl:,.2f}"
+                  + (f"; profit factor {pf}" if pf is not None else "") + ".")
+    by_exit = {}
+    for b in closed:
+        k = str(b.get("exitReason") or "?").split(" ")[0]
+        by_exit[k] = by_exit.get(k, 0.0) + _pl(b)
+    if by_exit:
+        worst = min(by_exit.items(), key=lambda x: x[1])
+        best = max(by_exit.items(), key=lambda x: x[1])
+        tk.append(f"Costliest exit type: {worst[0]} (${worst[1]:,.0f}); best: {best[0]} (${best[1]:,.0f}).")
+    by_style = {}
+    for b in closed:
+        k = str(b.get("style") or "other")
+        by_style.setdefault(k, []).append(_pl(b))
+    if by_style:
+        ws = min(by_style.items(), key=lambda x: sum(x[1]))
+        tk.append(f"Weakest style: {ws[0]} (${sum(ws[1]):,.0f} over {len(ws[1])} trades).")
+    state["takeaways"] = tk
     state["schema"] = "valuatio-bot-training/v1"
     state["generatedAt"] = datetime.now(timezone.utc).isoformat()
     state["startingBankroll"] = STARTING_BANKROLL
     return state
+
+
+# ----------------------------- risk book (z186) ---------------------------------
+def spy_returns(spy_data):
+    """SPY's daily returns by date from its history file (the market for every beta)."""
+    if not isinstance(spy_data, list):
+        return {}
+    dated = []
+    for b in spy_data:
+        c = _f(b.get("close")) or _f(b.get("price"))
+        if c and c > 0 and b.get("date"):
+            dated.append((str(b["date"])[:10], c))
+    return rb.returns_by_date(sorted(dated))
+
+
+def build_risk(state, universe, today, spy_rets, dialed):
+    """z186: the open book as the risk checks see it - drawdown from the high-water mark (-> the throttle on new
+    risk), today's change (-> the daily halt), every open position's exposure by sector, beta and recent returns."""
+    bankroll = float(state.get("bankroll", STARTING_BANKROLL))
+    open_pos = [p for p in trades_list(state) if p.get("status") == "open"]
+    value_now = bankroll + sum((p.get("pnl") or 0) for p in open_pos)
+    dd = rb.drawdown(state.get("equityCurve"), value_now)
+    chg = rb.day_change(state.get("equityCurve"), value_now, today)
+    halted = chg is not None and chg <= -rb.DAY_HALT
+    book = rb.Book(bankroll, dialed, dd["scale"], halted, today)
+    for p in open_pos:
+        tk = str(p.get("ticker") or "").upper()
+        u = universe.get(tk) or {}
+        g, sgn = rb.position_exposure(p, p.get("lastPrice") or u.get("price"))
+        dated = load_history_dated(tk, u.get("repo")) if u.get("repo") else None
+        rets = rb.returns_by_date(dated) if dated else None
+        b = rb.beta(rets, spy_rets) if (rets and spy_rets) else None
+        book.add(tk, p.get("sector") or u.get("sector"), p.get("direction"), g, sgn, b, rets,
+                 instrument="option" if p.get("instrument") == "option" else "shares")
+    return {"book": book, "scale": dd["scale"], "dd": dd, "dayChange": chg, "spyRets": spy_rets}
+
+
+def risk_report(risk, when):
+    """state['risk'] - what the app shows: the throttle, exposures, the caps and what they turned down."""
+    if not risk:
+        return None
+    out = {"at": when, "drawdown": risk["dd"], "dayChange": None if risk["dayChange"] is None else round(risk["dayChange"], 4),
+           "halted": risk["book"].halted, "shortsOn": ALLOW_SHORTS, "dialedIn": risk["book"].dialed,
+           "limits": dict(rb.knobs(), optionBookCap=tb.OPT_BOOK_PCT, optionTradePct=list(tb.OPT_TRADE_PCT), optionDeepPct=tb.DEEP_PCT)}
+    out.update(risk["book"].summary())
+    return out
+
+
+def log_risk(risk):
+    b, dd = risk["book"], risk["dd"]
+    sm = b.summary()
+    top = ", ".join(f"{k} {v:.0%}" for k, v in list(sm["bySector"].items())[:4])
+    log(f"risk: book ${dd['value']:,.0f} · high-water ${dd['hwm']:,.0f} ({dd['hwmDate']}) · drawdown {dd['dd']:.1%} → new risk x{dd['scale']:.2f}"
+        f" · today {('%+.2f%%' % (risk['dayChange'] * 100)) if risk['dayChange'] is not None else 'n/a'}{' · HALT' if b.halted else ''}")
+    log(f"risk: shares {sm['gross']:.0%} of the book (cap {rb.GROSS_CAP:.0%}) · options at risk {sm['optionRisk']:.1%} (cap {tb.OPT_BOOK_PCT:.0%}) · "
+        f"net {sm['net']:+.0%} · net beta {sm['netBeta']:+.0%} (cap ±{rb.NET_BETA_CAP[b.dialed]:.0%}) · top sectors {top or 'none'}"
+        + (f" · beyond the ±{rb.SECTOR_CAP:.0%} sector cap: {', '.join(sm['overSectorCap'])} (only trades that shrink them)" if sm["overSectorCap"] else "")
+        + f" · shorts {'on' if ALLOW_SHORTS else 'OFF'}")
 
 
 # ----------------------------- main -------------------------------------------
@@ -3077,6 +3310,14 @@ def main():
             except Exception as e:
                 log(f"  review without re-scoring ({e})")
             manage_open_positions(state, universe, sess["date"], review_ctx, review_only=True)
+            try:                                       # z186: end-of-day exposures for the app
+                rc_e = load_regime_certainty()
+                risk_e = build_risk(state, universe, sess["date"], spy_returns(fetch_json(SPY_HISTORY_URL, timeout=30)),
+                                    bool(rc_e and rc_e.get("dialedIn")))
+                log_risk(risk_e)
+                state["risk"] = risk_report(risk_e, datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            except Exception as e:
+                log(f"risk report unavailable ({type(e).__name__}: {e})")
             finalize_state(state, sig_before)
             recompute(state, universe, today)
             _write_state(state, "after-close review of open positions (no trades)")
@@ -3222,12 +3463,18 @@ def main():
     open_before = {t.get("id") for t in trades_list(state) if t.get("status") == "open"}
     # z121: exits only at fresh quotes (a stale one is not managed this pass, never filled at an old price)
     closed = manage_open_positions(state, fresh, today, ctx)
+    risk = None
+    try:                                               # z186: the risk book - sizes, caps, throttle, halt
+        risk = build_risk(state, universe, today, spy_returns(spy_data), not agnostic)
+        log_risk(risk)
+    except Exception as e:
+        log(f"risk book unavailable ({type(e).__name__}: {e}) - entries use the pre-z186 sizing")
     ok_entry, why = entry_window(sess, state)
     eligible = {t: u for t, u in fresh.items() if session_tradable(t)} if ok_entry else {}
     if ok_entry and eligible:
         log(f"entries: {len(eligible)} tickers with a fresh quote whose home market is open now")
         opened = open_new_trades(state, eligible, today, regime, grades, peer_ranks, xa, quad, opt_market, fed,
-                                 research=ctx["research"], patterns=ctx["patterns"], regime_ctx=regime_ctx)
+                                 research=ctx["research"], patterns=ctx["patterns"], regime_ctx=regime_ctx, risk=risk)
         state["lastEntryScan"] = {"date": sess["date"], "et": sess["et"], "opened": len(opened)}
     elif ok_entry:
         opened = []
@@ -3235,6 +3482,8 @@ def main():
     else:
         opened = []
         log(f"entries: {why}")
+    if risk:
+        state["risk"] = risk_report(risk, now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"))
     stamp_execution(state, ids_before, open_before, sess, universe, now_utc)
     finalize_state(state, sig_before)
     recompute(state, universe, today)
