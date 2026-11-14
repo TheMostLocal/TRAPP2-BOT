@@ -1,0 +1,33 @@
+# ============================================================
+#  >>> DESTINATION: TheMostLocal/TRAPP2-BOT
+#  >>> FILE PATH:   .github/workflows/tests.yml
+#  z186: the runner's unit tests (tests/) on every change to its code - today the risk book (sizes, sector and
+#  cluster caps, the net beta cap, the drawdown throttle, the loss cap). The runner is stdlib only, so nothing to
+#  install. A red run means don't let the runner trade this commit.
+# ============================================================
+name: Tests
+
+on:
+  push:
+    paths:
+      - 'pipeline/**'
+      - 'tests/**'
+      - '.github/workflows/tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile the runner
+        run: python -m py_compile pipeline/*.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
