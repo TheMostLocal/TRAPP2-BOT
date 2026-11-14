@@ -1,0 +1,298 @@
+# ============================================================
+#  >>> DESTINATION: TheMostLocal/TRAPP2-BOT
+#  >>> FILE PATH:   pipeline/risk_book.py
+#  z186 - THE RISK BOOK: how much one trade may lose, how much of the book one theme may hold, and how the bot
+#  takes less risk while it is losing. Signals pick the trades; this decides their size and whether the book can
+#  take them. Every knob is a repo Variable (RUNNER_RISK_*); the defaults are below.
+#
+#  Why (the 10-30 -> 11-09 drawdown, -9.4 % while SPY was -0.4 %): it was the book's construction, not the market.
+#    * one theme, one day: eight energy longs opened 10-16 / 10-17 at ~3.8 % each (~30 % of the book), all
+#      correlated, all stopped or timed out at -6 % .. -18 % (energy -$5,773 over 15 trades);
+#    * options sized like stock: 1-2.5 % of the bankroll of premium on low-conviction calls, five medium-term calls
+#      all stopped at -57 .. -67 %, one put credit spread lost $2,926 (2.6 % of the book in one trade);
+#    * risk not budgeted: every position ~3.8 % of the book whatever its stop (7 % / 12 % / 25 %) or volatility -
+#      a core position risked 3.5x what a short-term one did;
+#    * no shorts: RUNNER_ALLOW_SHORTS was off, so all 57 runner trades were long (owner direction §1d: longs AND
+#      shorts) - nothing in the book could gain when its longs fell;
+#    * a stop that moved: a swing trade re-scored as "core" lost its stop (MPC, VLO: -8 % stops, closed at -17 %).
+#
+#  What it does: risk-budgeted sizes (the loss at the stop, not the notional, is what's fixed), caps per sector and
+#  per correlated cluster (a sector's NET is capped, so a short against a long-heavy sector is a hedge, not a breach),
+#  a net beta cap that depends on whether the regime call is dialed in (§1b), a cap on the
+#  new risk taken per session, a per-position loss cap, a drawdown throttle (smaller new trades while the book is
+#  below its high-water mark - it keeps trading, explore mode keeps collecting data) and a daily halt.
+# ============================================================
+import math
+import os
+
+
+def _envf(name, default):
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+RISK_PER_TRADE = _envf("RUNNER_RISK_PER_TRADE", 0.40) / 100       # loss at the effective stop, confidence 0.5
+RISK_PER_TRADE_MAX = _envf("RUNNER_RISK_PER_TRADE_MAX", 0.60) / 100   # ... at confidence 1.0
+VOL_STOP_MULT = _envf("RUNNER_RISK_VOL_STOP_MULT", 2.5)            # effective stop >= 2.5 daily sigmas (gaps, noise)
+MAX_POS_DAILY_VOL = _envf("RUNNER_RISK_MAX_POS_VOL", 0.12) / 100   # one position's 1-sigma day <= 0.12 % of the book
+SECTOR_CAP = _envf("RUNNER_RISK_SECTOR_CAP", 15) / 100             # one sector's NET <= 15 % of the bankroll
+SECTOR_GROSS_CAP = _envf("RUNNER_RISK_SECTOR_GROSS", 30) / 100      # ... and its gross (longs + shorts) <= 30 %
+SECTOR_NEW_MAX = int(_envf("RUNNER_RISK_SECTOR_NEW", 2))           # new positions per sector per session
+CLUSTER_CORR = _envf("RUNNER_RISK_CLUSTER_CORR", 0.70)             # same-direction names this correlated = one bet
+CLUSTER_MAX = int(_envf("RUNNER_RISK_CLUSTER_MAX", 2))             # positions per correlated cluster
+NET_BETA_CAP = {False: _envf("RUNNER_RISK_NET_BETA", 45) / 100,     # |net beta-weighted exposure| / bankroll
+                True: _envf("RUNNER_RISK_NET_BETA_DIALED", 80) / 100}  # ... once the regime call is dialed in
+GROSS_CAP = _envf("RUNNER_RISK_GROSS_CAP", 110) / 100              # gross shares notional / bankroll
+NEW_RISK_PER_DAY = _envf("RUNNER_RISK_NEW_PER_DAY", 2.5) / 100     # sum of new trades' risk at the stop, per session
+POS_LOSS_CAP = _envf("RUNNER_RISK_POS_LOSS_CAP", 0.75) / 100       # an open position losing more is closed (risk-cap)
+DAY_HALT = _envf("RUNNER_RISK_DAY_HALT", 2.0) / 100                # book down this much on the day -> no new entries
+DD_WINDOW = int(_envf("RUNNER_RISK_DD_WINDOW", 90))                # high-water mark over the last 90 curve points
+DD_STEPS = ((0.04, 1.00), (0.08, 0.70), (0.12, 0.50), (9.99, 0.35))   # drawdown -> scale on new risk
+MIN_SHORT_PRICE = _envf("RUNNER_RISK_MIN_SHORT_PX", 10)            # no short sales under $10 ...
+MIN_SHORT_CAP = _envf("RUNNER_RISK_MIN_SHORT_CAP", 2e9)            # ... or under a $2B market cap (borrow, squeezes)
+VOL_WIN, BETA_WIN, CORR_WIN = 60, 500, 60
+
+
+# ------------------------------------------------------------------------------------------- statistics ----
+def returns_by_date(dated):
+    """[(date, close)] ascending -> {date: log return} (a return is dated by the day it ends)."""
+    out = {}
+    for (d0, c0), (d1, c1) in zip(dated, dated[1:]):
+        if c0 and c1 and c0 > 0 and c1 > 0:
+            r = math.log(c1 / c0)
+            if abs(r) < math.log(2.5):                 # z185: a jump beyond x2.5 is a data question, not a move
+                out[d1] = r
+    return out
+
+
+def _tail(rets, n):
+    ks = sorted(rets)[-n:]
+    return {k: rets[k] for k in ks}
+
+
+def sigma(rets, n=VOL_WIN):
+    """Daily volatility of the last n returns (None with fewer than 20)."""
+    x = list(_tail(rets, n).values())
+    if len(x) < 20:
+        return None
+    m = sum(x) / len(x)
+    return math.sqrt(sum((v - m) ** 2 for v in x) / (len(x) - 1))
+
+
+def _paired(a, b, n):
+    ks = sorted(set(a) & set(b))[-n:]
+    return [a[k] for k in ks], [b[k] for k in ks]
+
+
+def beta(rets, mkt, n=BETA_WIN):
+    """The beta the risk book uses: two years against SPY, shrunk a third of the way to 1 (Blume) - a one-year beta
+    swings too much to cap on (this year COP's was -0.67 over 250 sessions, +0.44 over 500). A structurally inverse
+    product (raw beta below -0.5: SQQQ, SPXS) keeps its raw beta - held long, it is a short in this book."""
+    b = beta_raw(rets, mkt, n)
+    if b is None or b < -0.5:
+        return b
+    return (2.0 / 3.0) * b + 1.0 / 3.0
+
+
+def beta_raw(rets, mkt, n=BETA_WIN):
+    """OLS beta to the market over the last n common dates (None with fewer than 30)."""
+    x, y = _paired(mkt, rets, n)
+    if len(x) < 30:
+        return None
+    mx, my = sum(x) / len(x), sum(y) / len(y)
+    vx = sum((a - mx) ** 2 for a in x)
+    if vx <= 0:
+        return None
+    return sum((a - mx) * (b - my) for a, b in zip(x, y)) / vx
+
+
+def corr(a, b, n=CORR_WIN):
+    x, y = _paired(a, b, n)
+    if len(x) < 30:
+        return None
+    mx, my = sum(x) / len(x), sum(y) / len(y)
+    sx = math.sqrt(sum((v - mx) ** 2 for v in x))
+    sy = math.sqrt(sum((v - my) ** 2 for v in y))
+    if sx <= 0 or sy <= 0:
+        return None
+    return sum((p - mx) * (q - my) for p, q in zip(x, y)) / (sx * sy)
+
+
+# ---------------------------------------------------------------------------------- the book's condition ----
+def drawdown(curve, value_now, window=DD_WINDOW):
+    """High-water mark over the last `window` daily book values (and now) -> {hwm, hwmDate, value, dd, scale}.
+    A rolling mark: an old restatement or deposit falls out of it instead of setting the bar forever."""
+    pts = [p for p in (curve or []) if isinstance(p, dict) and isinstance(p.get("value"), (int, float))][-window:]
+    hwm, hwm_d = value_now, "now"
+    for p in pts:
+        if p["value"] > hwm:
+            hwm, hwm_d = p["value"], p.get("date")
+    dd = max(0.0, 1 - value_now / hwm) if hwm > 0 else 0.0
+    scale = next(s for lim, s in DD_STEPS if dd < lim)
+    return {"hwm": round(hwm, 2), "hwmDate": hwm_d, "value": round(value_now, 2), "dd": round(dd, 4), "scale": scale}
+
+
+def day_change(curve, value_now, today):
+    """Today's book change against the last close before today (None without one)."""
+    prev = [p for p in (curve or []) if isinstance(p, dict) and str(p.get("date") or "") < today and isinstance(p.get("value"), (int, float))]
+    if not prev or prev[-1]["value"] <= 0:
+        return None
+    return value_now / prev[-1]["value"] - 1
+
+
+def position_exposure(pos, price):
+    """(gross $, signed $) a position puts on: shares at their market value; options and spreads at the most they
+    can lose (premium / max loss) - their dollar risk, which is what a sector cap should count."""
+    if pos.get("instrument") == "option":
+        g = float(pos.get("maxLoss") or pos.get("notional") or 0)
+        # "direction" is the view (a put bought on a bearish idea is "short"; a put credit spread sold on a bullish
+        # one is "long"), whatever the contract
+        return g, (-g if pos.get("direction") == "short" else g)
+    sh = float(pos.get("shares") or 0)
+    px = price or pos.get("lastPrice") or pos.get("entryPrice") or 0
+    g = abs(sh * float(px)) if sh else float(pos.get("notional") or 0)
+    return g, (-g if pos.get("direction") == "short" else g)
+
+
+class Book:
+    """The open book as the risk checks see it: exposures by sector, net beta, the held names' returns (for
+    clusters), the risk already added this session. Built once per pass; updated as trades are added."""
+
+    def __init__(self, bankroll, regime_dialed=False, scale=1.0, halted=False, today=None):
+        self.bankroll = float(bankroll)
+        self.dialed = bool(regime_dialed)
+        self.scale, self.halted, self.today = scale, halted, today
+        self.gross = self.net = self.net_beta = self.option_risk = 0.0
+        self.sector = {}                # sector -> {"gross", "n", "new"}
+        self.held = []                  # (ticker, direction(+1/-1), returns by date)
+        self.new_risk = 0.0
+        self.new_count = 0
+        self.rejects = {}
+
+    def add(self, ticker, sector, direction, gross, signed, beta_v=None, rets=None, new_risk=0.0, new=False, instrument="shares"):
+        s = self.sector.setdefault(sector or "Unknown", {"gross": 0.0, "net": 0.0, "n": 0, "new": 0})
+        s["gross"] += gross
+        s["net"] += signed
+        s["n"] += 1
+        if new:
+            s["new"] += 1
+            self.new_risk += new_risk
+            self.new_count += 1
+        if instrument == "option":
+            self.option_risk += gross
+        else:
+            self.gross += gross
+        self.net += signed
+        self.net_beta += signed * (beta_v if beta_v is not None else 1.0)
+        if rets:
+            self.held.append((ticker, 1 if signed >= 0 else -1, rets))
+
+    def cluster_of(self, rets, direction):
+        """Held names in the candidate's direction whose returns move with it (corr >= CLUSTER_CORR)."""
+        if not rets:
+            return []
+        out = []
+        for t, d, r in self.held:
+            if d != direction:
+                continue
+            c = corr(rets, r)
+            if c is not None and c >= CLUSTER_CORR:
+                out.append((t, round(c, 2)))
+        return out
+
+    def check(self, ticker, sector, direction, gross, signed, beta_v, rets, risk, instrument="shares"):
+        """-> (ok, reason). Order: halt, sector caps and count, cluster, gross, net beta, new risk today. A trade that
+        shrinks its sector's net exposure (a short against a long-heavy sector) passes the net cap - it is a hedge."""
+        B = self.bankroll
+        why = None
+        sec = self.sector.get(sector or "Unknown", {"gross": 0.0, "net": 0.0, "n": 0, "new": 0})
+        known = (sector or "Unknown") not in ("Unknown", "")
+        net_after = sec["net"] + signed
+        if self.halted:
+            why = "daily halt"
+        elif known and abs(net_after) > SECTOR_CAP * B and abs(net_after) > abs(sec["net"]):
+            why = f"sector cap: {sector} net {sec['net'] / B:+.0%} {'+' if signed >= 0 else '-'} {gross / B:.1%} beyond ±{SECTOR_CAP:.0%}"
+        elif known and sec["gross"] + gross > SECTOR_GROSS_CAP * B:
+            why = f"sector gross cap: {sector} {sec['gross'] / B:.0%} + {gross / B:.1%} > {SECTOR_GROSS_CAP:.0%}"
+        elif known and sec["new"] >= SECTOR_NEW_MAX:
+            why = f"sector new-trade limit: {SECTOR_NEW_MAX} new {sector} today"
+        else:
+            cl = self.cluster_of(rets, 1 if signed >= 0 else -1)
+            if len(cl) >= CLUSTER_MAX:
+                why = "cluster: moves with " + ", ".join(f"{t} ({c:+.2f})" for t, c in cl[:3])
+            elif instrument != "option" and self.gross + gross > GROSS_CAP * B:
+                why = f"gross cap: {(self.gross + gross) / B:.0%} > {GROSS_CAP:.0%}"
+            else:
+                nb = self.net_beta + signed * (beta_v if beta_v is not None else 1.0)
+                cap = NET_BETA_CAP[self.dialed] * B
+                if abs(nb) > cap and abs(nb) > abs(self.net_beta):
+                    why = f"net beta cap: {nb / B:+.0%} (cap ±{NET_BETA_CAP[self.dialed]:.0%}, regime {'dialed in' if self.dialed else 'not dialed in'})"
+                elif self.new_risk + risk > NEW_RISK_PER_DAY * B:
+                    why = f"new-risk cap: {(self.new_risk + risk) / B:.2%} of the book today > {NEW_RISK_PER_DAY:.1%}"
+        if why:
+            key = why.split(":")[0]
+            self.rejects[key] = self.rejects.get(key, 0) + 1
+            return False, why
+        return True, ""
+
+    def summary(self):
+        B = self.bankroll or 1
+        sect = sorted(((k, v["net"], v["gross"]) for k, v in self.sector.items()), key=lambda x: -abs(x[1]))
+        return {"gross": round(self.gross / B, 4), "net": round(self.net / B, 4), "netBeta": round(self.net_beta / B, 4),
+                "optionRisk": round(self.option_risk / B, 4),
+                "bySector": {k: round(n / B, 4) for k, n, g in sect},                      # net, signed
+                "bySectorGross": {k: round(g / B, 4) for k, n, g in sect},
+                "overSectorCap": [k for k, n, g in sect if abs(n) > SECTOR_CAP * B and k not in ("Unknown", "")],
+                "newRisk": round(self.new_risk / B, 4), "newTrades": self.new_count, "rejects": dict(self.rejects)}
+
+
+# ------------------------------------------------------------------------------------------------ sizing ----
+def per_trade_risk(conf):
+    c = max(0.0, min(1.0, ((conf or 0.5) - 0.5) / 0.5))
+    return RISK_PER_TRADE + (RISK_PER_TRADE_MAX - RISK_PER_TRADE) * c
+
+
+def size_shares(bankroll, conf, stop_pct, sig, scale=1.0, cap_notional=None):
+    """-> (notional, risk $, effective stop, why). The loss at the effective stop - the planned stop, or 2.5 daily
+    sigmas if the name moves more than that - is the budget; a volatile name gets a smaller position, a 25 % core
+    stop gets a smaller one than a 7 % short-term stop. Also: one position's 1-sigma day <= MAX_POS_DAILY_VOL."""
+    eff = max(stop_pct or 0.0, VOL_STOP_MULT * sig if sig else 0.0)
+    if eff <= 0:
+        eff = 0.10                                    # no stop and no history: assume 10 %
+    budget = bankroll * per_trade_risk(conf) * scale
+    n1 = budget / eff
+    n2 = (bankroll * MAX_POS_DAILY_VOL / sig) if sig else n1
+    notional = min(n1, n2, cap_notional if cap_notional is not None else n1)
+    why = "risk budget" if notional == n1 else ("volatility cap" if notional == n2 else "size cap")
+    return notional, notional * eff, eff, why
+
+
+def shortable(u):
+    """A short sale needs a liquid, borrowable name: >= $10, >= $2B market cap, a stock (not a fund or a leveraged
+    product). Paper trading has no borrow desk; this keeps the shorts realistic."""
+    px, mc = u.get("price") or 0, u.get("marketcap")
+    if px < MIN_SHORT_PRICE:
+        return False, f"price ${px:.2f} < ${MIN_SHORT_PRICE:.0f}"
+    if mc is not None and mc < MIN_SHORT_CAP:
+        return False, f"market cap ${mc / 1e9:.1f}B < ${MIN_SHORT_CAP / 1e9:.0f}B"
+    if str(u.get("isetf") or "").lower() == "true":
+        return False, "a fund (no single-name short)"
+    return True, ""
+
+
+def pos_loss_capped(pos, bankroll):
+    """True when an open position's loss exceeds POS_LOSS_CAP of the bankroll (shares only - an option's premium is
+    already its most it can lose)."""
+    if pos.get("instrument") == "option":
+        return False
+    return (pos.get("pnl") or 0) < -POS_LOSS_CAP * bankroll
+
+
+def knobs():
+    return {"riskPerTrade": [RISK_PER_TRADE, RISK_PER_TRADE_MAX], "volStopMult": VOL_STOP_MULT, "maxPosDailyVol": MAX_POS_DAILY_VOL,
+            "sectorCap": SECTOR_CAP, "sectorGrossCap": SECTOR_GROSS_CAP, "sectorNewMax": SECTOR_NEW_MAX, "clusterCorr": CLUSTER_CORR, "clusterMax": CLUSTER_MAX,
+            "netBetaCap": {"notDialedIn": NET_BETA_CAP[False], "dialedIn": NET_BETA_CAP[True]}, "grossCap": GROSS_CAP,
+            "newRiskPerDay": NEW_RISK_PER_DAY, "posLossCap": POS_LOSS_CAP, "dayHalt": DAY_HALT,
+            "drawdownSteps": [list(x) for x in DD_STEPS], "ddWindow": DD_WINDOW}
