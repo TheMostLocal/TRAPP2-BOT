@@ -230,6 +230,10 @@ SHORT_SCORE = -MIN_SCORE - 0.10   # a bit more conviction to short
 SHORT_PCTL = _envf("RUNNER_SHORT_PCTL", 10) / 100
 SHORT_FLOOR = _envf("RUNNER_SHORT_FLOOR", -0.15)
 SHORT_SLOTS = int(_envf("RUNNER_SHORT_SLOTS", 2))   # session slots kept for the best shorts, when there are any
+# z190: a short sale the rules never allowed (a fund / ETP - rb.fund_reason) is unwound at the next pass, minimum hold or
+# not: 11-16 the runner shorted GLD, SOXL, TAN and WGMI while a throttled profile fetch had wiped TRAPP2-1's fund flags.
+# Repo Variable RUNNER_UNWIND_UNSHORTABLE = 0 keeps such positions instead.
+UNWIND_UNSHORTABLE = os.environ.get("RUNNER_UNWIND_UNSHORTABLE", "1").strip().lower() not in ("0", "false", "no", "off")
 FEE_BPS = 0.0005  # ~5bps/side, matches the app's estimate
 
 
@@ -371,6 +375,7 @@ def load_universe():
                 "asOf": r.get("fetched_at") if fld == "price" else None,   # z121: a close is never a live quote
                 "assetClass": r.get("asset_class"),
                 "isetf": str(r.get("isetf") or "").lower(),          # z186: funds aren't single-name shorts
+                "isfund": str(r.get("isfund") or "").lower(),        # z190: ... nor are mutual / closed-end funds
                 "sector": r.get("sector") or "Unknown",
                 "name": r.get("name") or t,
                 "repo": repo,
@@ -2497,6 +2502,12 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
             # z186: no single name may cost the book more than RUNNER_RISK_POS_LOSS_CAP (0.75 %) - a backstop for
             # gaps and for positions sized before the risk book
             exit_reason = "risk-cap"
+        if not exit_reason and UNWIND_UNSHORTABLE and direction == -1 and (pos.get("instrument") or "shares") == "shares":
+            _why = rb.fund_reason(u)
+            if _why:
+                # z190: the rule (§1d 3) says a short sale needs a single stock - this one never qualified
+                exit_reason = "not-shortable"
+                log(f"  {pos.get('ticker')}: short sale in {_why} - unwound (RUNNER_UNWIND_UNSHORTABLE=0 keeps it)")
         if exit_reason and review_only:
             review_lines.append(tb.review(pos, today, price=px, ret=ret, days_held=days_held, min_hold=min_hold, decision="flag",
                                           reason=f"{exit_reason} at ${px:,.2f} - acts at the next session's first pass", score_now=signed_now, cat=cat))
