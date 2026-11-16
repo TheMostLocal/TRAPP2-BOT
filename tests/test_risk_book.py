@@ -1,7 +1,8 @@
 # ============================================================
 #  >>> DESTINATION: TheMostLocal/TRAPP2-BOT
 #  >>> FILE PATH:   tests/test_risk_book.py
-#  z186: the risk book - sizes, caps, the drawdown throttle. Run: python -m unittest discover -s tests
+#  z186: the risk book - sizes, caps, the drawdown throttle. z190: short sales need a single stock by every sign.
+#  Run: python -m unittest discover -s tests
 # ============================================================
 import math
 import random
@@ -151,6 +152,34 @@ class Caps(unittest.TestCase):
         self.assertTrue(rb.pos_loss_capped({"pnl": -800}, 100_000))
         self.assertFalse(rb.pos_loss_capped({"pnl": -700}, 100_000))
         self.assertFalse(rb.pos_loss_capped({"pnl": -5_000, "instrument": "option"}, 100_000))
+
+    def test_z190_funds_by_any_sign(self):
+        # 11-16: TRAPP2-1's ETFs arrived with no name, isetf "false" and no market cap; the runner shorted four of them
+        gld = {"ticker": "GLD", "price": 356.0, "marketcap": None, "isetf": "false", "name": "GLD", "repo": "TRAPP2-1"}
+        soxl = dict(gld, ticker="SOXL", price=49.6, name="SOXL")
+        for u in (gld, soxl):
+            ok, why = rb.shortable(u)
+            self.assertFalse(ok)
+            self.assertIn("macro book", why)
+        self.assertIn("ETF", rb.shortable({"ticker": "SPY", "price": 744.0, "marketcap": None, "isetf": "true", "repo": "TRAPP2"})[1])
+        self.assertIn("a fund", rb.shortable({"ticker": "VFIAX", "price": 600.0, "marketcap": 5e10, "isfund": "true"})[1])
+        lev = {"ticker": "TNA", "price": 40.0, "marketcap": 3e9, "isetf": "false", "repo": "TRAPP2-3",
+               "name": "Direxion Daily Small Cap Bull 3X Shares"}
+        self.assertIn("leveraged", rb.shortable(lev)[1])
+        self.assertIn("leveraged", rb.fund_reason(dict(lev, name="GraniteShares 2x Long NVDA Daily ETF")))
+        # names that only look like it stay stocks
+        for nm in ("Build-A-Bear Workshop, Inc.", "Ultra Clean Holdings, Inc.", "Northern Trust Corporation", "iShares Inc"):
+            self.assertEqual(rb.fund_reason({"ticker": "X", "name": nm, "repo": "TRAPP2-2"}), "", nm)
+        # a foreign listing in the macro book is not an ETF by that rule (it can't be opened in session anyway)
+        self.assertEqual(rb.fund_reason({"ticker": "000660.KS", "repo": "TRAPP2-1", "name": "SK hynix Inc."}), "")
+
+    def test_z190_market_cap_must_be_known_and_in_usd(self):
+        beam = {"ticker": "BEAM", "price": 22.08, "marketcap": 2.30e9, "marketcapUSD": 2.30e9, "isetf": "false", "repo": "TRAPP2-2"}
+        self.assertTrue(rb.shortable(beam)[0])                                  # today's one real short: a $2.3B stock
+        self.assertIn("unknown", rb.shortable(dict(beam, marketcap=None, marketcapUSD=None))[1])
+        # a cap in another currency's units is judged in USD (2,300 B yen ~ $15B passes; 250 B yen ~ $1.6B doesn't)
+        self.assertTrue(rb.shortable(dict(beam, marketcap=2.3e12, marketcapUSD=15.3e9))[0])
+        self.assertFalse(rb.shortable(dict(beam, marketcap=2.5e11, marketcapUSD=1.6e9))[0])
 
     def test_returns_drop_data_jumps(self):
         r = rb.returns_by_date([("a", 100.0), ("b", 101.0), ("c", 10.0), ("d", 10.2)])
