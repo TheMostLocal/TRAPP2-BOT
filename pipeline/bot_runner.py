@@ -358,6 +358,13 @@ def load_universe():
             if f is None:
                 no_rate[t] = ccy
                 continue
+            # z187: market caps are in the quote currency's MAIN unit (Glencore: price in pence, cap in pounds) and the
+            # statements in the reporting currency (TSM: TWD) - both to USD here, so size tiers and P/S compare like
+            # with like across listings
+            mc_f = fx.get(_SUBUNIT.get(ccy.strip(), (ccy.strip().upper(), 1.0))[0])
+            fin = str(r.get("financialCurrency") or "").strip()
+            fin_f = fx.get(_SUBUNIT.get(fin, (fin.upper(), 1.0))[0]) if fin else mc_f
+            mc_raw = _f(r.get("marketcap"))
             rows[t] = {
                 "ticker": t, "price": round(price * f, 6),
                 "priceLocal": price, "currency": ccy, "fxRate": f, "scan": scan,
@@ -391,6 +398,18 @@ def load_universe():
                 "priceToBook": _f(r.get("priceToBook")),
                 "dividend_yield": _f(r.get("dividend_yield")),
                 "payoutRatio": _f(r.get("payoutRatio")),
+                # z187: currency-consistent valuation from the books' pipeline (priced at the row's price) + the raw
+                # pieces to rebuild it for a row written before z187
+                "priceToSales": _f(r.get("priceToSales")),
+                "evToEbitda": _f(r.get("evToEbitda")),
+                "valuationNote": str(r.get("valuationNote") or ""),
+                "valuationZ187": "valuationNote" in r,
+                "financialCurrency": fin or ccy,
+                "marketcapUSD": (mc_raw * mc_f) if (mc_raw and mc_f) else None,
+                "finUsd": fin_f,
+                "industry": r.get("industry") or "",
+                "nameWas": r.get("nameWas"),
+                "nameChangedAt": r.get("nameChangedAt"),
             }
     n_scan = sum(1 for v in rows.values() if v["scan"])
     n_conv = sum(1 for v in rows.values() if v["fxRate"] != 1.0)
@@ -402,6 +421,16 @@ def load_universe():
     n_fx = add_fx_instruments(rows, fx)                      # z164: currencies as USD-priced instruments
     if n_fx:
         log(f"  {n_fx} currencies tradable as FX:<CCY> (USD per unit, rates of {FX_ASOF.get('at')})")
+    try:                                                     # z187: sector valuation medians for the relative step
+        VAL_STATS.clear()
+        VAL_STATS.update(valuation_stats(rows))
+        al = VAL_STATS.get("_all") or {}
+        z = sum(1 for v in rows.values() if v.get("valuationZ187"))
+        log(f"  valuation: {max(0, len(VAL_STATS) - 1)} sectors with medians · universe P/E {al.get('pe', 0):.1f} · P/S {al.get('ps', 0):.2f} · "
+            f"P/B {al.get('pb', 0):.2f} · EV/EBITDA {al.get('evEbitda', 0):.1f} · {z} rows priced by the z187 pipeline "
+            f"(the rest rebuilt here from their raw fields, in USD)")
+    except Exception as e:
+        log(f"  valuation medians unavailable ({type(e).__name__}: {e}) - absolute valuation rules")
     return rows
 
 
@@ -1767,41 +1796,85 @@ def realized_pnl(pos, exit_price):
     return round(direction * (exit_price - entry) * shares * lev - fees, 2)
 
 
+VAL_STATS = {}           # z187: sector -> {pe, ps, pb, evEbitda: median}; "_all" = the whole equity universe
+VAL_METRICS = (("pe", "pe"), ("ps", "priceToSales"), ("pb", "priceToBook"), ("evEbitda", "evToEbitda"))
+VAL_MIN_PEERS = 8
+# how much P/B says about value, by sector: book is the business for lenders / insurers / REITs and matters for asset-heavy
+# sectors; for software, brands and pharma it mostly measures past buybacks
+PB_SECTOR_W = {"Financial Services": 1.0, "Real Estate": 0.9, "Energy": 0.55, "Basic Materials": 0.55, "Utilities": 0.55,
+               "Industrials": 0.4}
+VAL_W = {"pe": 1.0, "ps": 0.7, "evEbitda": 0.8}
+
+
 def _norm_fund(u):
     """Map master.json fields to the engine's names + derive missing ratios.
-    Faithful to the app's normalizeEngineFields."""
+    Faithful to the app's normalizeEngineFields - z187: in ONE currency (USD) and at the row's price:
+      * market cap in USD (size tiers compared Tokyo yen caps with dollar caps)
+      * P/S from the pipeline (z187 rows) or market cap / revenue both converted to USD (TSM was 0.4 "cheap", truly ~13)
+      * P/B from the pipeline; for a row written before z187, rebuilt as market cap / total equity in USD - never
+        Yahoo's (it mixes currencies for ADRs - TSM 76, ASML 1,284 - and share classes - BRK-B 0.001); never for
+        negative book
+      * Debt/Equity: Yahoo's is a PERCENT (84 = 0.84x) - the app divides by 100 on load, the bot read it raw, so almost
+        every company scored as "debt > 2x equity" (-20 on balance-sheet strength)"""
     def n(v):
         try:
             x = float(v)
             return x if (x == x and x not in (float("inf"), float("-inf"))) else None
         except (TypeError, ValueError):
             return None
+    note = str(u.get("valuationNote") or "")
+    z187 = bool(u.get("valuationZ187"))
+    cur = str(u.get("currency") or "USD").strip()
+    q_main = _SUBUNIT.get(cur, (cur.upper(), 1.0))[0]
+    fcur = str(u.get("financialCurrency") or cur).strip()
+    same_ccy = _SUBUNIT.get(fcur, (fcur.upper(), 1.0))[0] == q_main
+    mc_raw, mc_usd, fin_usd = n(u.get("marketcap")), n(u.get("marketcapUSD")), n(u.get("finUsd"))
+    if mc_raw is None:
+        mc_raw = n(u.get("marketCap"))
+    eq = n(u.get("totalEquity"))
     f = {
-        "marketCap": n(u.get("marketcap")) if n(u.get("marketcap")) is not None else n(u.get("marketCap")),
+        "marketCap": mc_usd if mc_usd is not None else (mc_raw if q_main == "USD" else None),
         "eps": n(u.get("eps")),
         "netMargin": n(u.get("profitMargin")),
         "freeCashFlow": n(u.get("freeCashFlow")),
         "roe": n(u.get("returnOnEquity")),
-        "debtToEquity": n(u.get("debtToEquity")),
+        "debtToEquity": (n(u.get("debtToEquity")) / 100.0) if n(u.get("debtToEquity")) is not None else None,
         "currentRatio": n(u.get("currentRatio")),
         "cash": n(u.get("cash")),
         "totalDebt": n(u.get("totalDebt")),
-        "totalEquity": n(u.get("totalEquity")),
+        "totalEquity": eq,
         "pe": n(u.get("pe")),
-        "priceToBook": n(u.get("priceToBook")),
+        "priceToBook": None,
+        "evToEbitda": None,
         "revenueGrowth": n(u.get("revenueGrowth")),
         "payoutRatio": n(u.get("payoutRatio")),
+        "mcapSuspect": "mcap?" in note,
+        "negBook": ("neg-book" in note) or (eq is not None and eq < 0),
     }
     if f["debtToEquity"] is None:
-        d, e = n(u.get("totalDebt")), n(u.get("totalEquity"))
-        if d is not None and e and e > 0:
-            f["debtToEquity"] = d / e
+        d = n(u.get("totalDebt"))
+        if d is not None and eq and eq > 0:
+            f["debtToEquity"] = d / eq
     ps = n(u.get("priceToSales"))
-    if ps is None:
-        mc, rev = f["marketCap"], n(u.get("revenue"))
-        if mc is not None and rev and rev > 0:
-            ps = mc / rev
-    f["priceToSales"] = ps
+    rev = n(u.get("revenue"))
+    if ps is None and not z187 and rev and rev > 0:          # a row written before z187: rebuild, in one currency
+        if mc_usd and fin_usd:
+            ps = mc_usd / (rev * fin_usd)
+        elif same_ccy and mc_raw:
+            ps = mc_raw / rev
+    f["priceToSales"] = ps if (ps is not None and ps > 0) else None
+    pb, eve = n(u.get("priceToBook")), n(u.get("evToEbitda"))
+    if z187:
+        f["priceToBook"] = pb if (pb is not None and pb > 0 and not f["negBook"]) else None
+        f["evToEbitda"] = eve if (eve is not None and eve > 0) else None
+    else:                                                   # a row from before z187 - the same rules as research
+        if eq and eq > 0:
+            if mc_usd and fin_usd:
+                f["priceToBook"] = mc_usd / (eq * fin_usd)
+            elif same_ccy and mc_raw:
+                f["priceToBook"] = mc_raw / eq
+        if same_ccy:                                        # Yahoo's cross-currency EV ratios are wrong - dropped
+            f["evToEbitda"] = eve if (eve is not None and eve > 0) else None
     # master.json emits dividend_yield as a PERCENT (0.49 = 0.49%) → decimal.
     dy = n(u.get("dividend_yield"))
     if dy is None:
@@ -1813,6 +1886,104 @@ def _norm_fund(u):
     else:
         f["dividendYield"] = (dy / 100) if dy <= 40 else None
     return f
+
+
+def _val_inputs(f):
+    """The multiples the valuation step may use: P/E always (per share, currency-correct); P/S, P/B and EV/EBITDA only
+    when the market cap they divide is trusted (a 'mcap?' row - an ADR-ratio or one-share-class cap - keeps P/E only)."""
+    out = {}
+    if f.get("pe") and f["pe"] > 0:
+        out["pe"] = f["pe"]
+    if not f.get("mcapSuspect"):
+        for m, k in VAL_METRICS[1:]:
+            v = f.get(k)
+            if v and v > 0:
+                out[m] = v
+    return out
+
+
+def valuation_stats(rows):
+    """z187: median P/E, P/S, P/B and EV/EBITDA per sector (>= 8 companies with the figure) and for the whole equity
+    universe - what 'cheap' means is relative: a grocer at 0.3x sales isn't cheap, software at 6x may be."""
+    by = {}
+    for u in rows.values():
+        if (u.get("assetClass") or "Equity") != "Equity" or str(u.get("isetf") or "") == "true":
+            continue
+        vals = _val_inputs(_norm_fund(u))
+        for key in (u.get("sector") or "Unknown", "_all"):
+            d = by.setdefault(key, {})
+            for m, v in vals.items():
+                d.setdefault(m, []).append(v)
+    out = {}
+    for key, d in by.items():
+        med = {}
+        for m, vs in d.items():
+            if len(vs) >= VAL_MIN_PEERS:
+                vs = sorted(vs)
+                k = len(vs) // 2
+                med[m] = vs[k] if len(vs) % 2 else (vs[k - 1] + vs[k]) / 2
+        if med:
+            out[key] = med
+    return out
+
+
+def valuation_points(f, sector, quality):
+    """z187: the valuation step, SECTOR-RELATIVE. Each multiple vs its sector median (the universe's when the sector
+    has < 8 peers): -tanh(ln(multiple / median) / 0.5) - 30 % cheaper scores about +0.6, twice as dear about -0.9.
+    Weights: P/E 1.0 (a quality company's premium counts 40 % less against it), P/S 0.7 (1.0 when there are no
+    earnings), EV/EBITDA 0.8, P/B by sector (1.0 banks / insurers ... 0.3 software). 50 = fairly valued; 14..86.
+    None when no multiple has a median to compare with (the absolute rules then apply)."""
+    st, al = VAL_STATS.get(sector or "Unknown") or {}, VAL_STATS.get("_all") or {}
+    use = _val_inputs(f)
+    num = den = 0.0
+    for m, v in use.items():
+        med = st.get(m) or al.get(m)
+        if not med or med <= 0:
+            continue
+        s = -math.tanh(math.log(v / med) / 0.5)
+        if m == "pe" and quality and s < 0:
+            s *= 0.6
+        w = PB_SECTOR_W.get(sector, 0.3) if m == "pb" else VAL_W[m]
+        if m == "ps" and "pe" not in use:
+            w = 1.0
+        num += w * s
+        den += w
+    return (50.0 + 36.0 * num / den) if den else None
+
+
+def valuation_card(u):
+    """z187: the multiples a trade was judged on, next to its sector's medians - on the trade record (Bets tab)."""
+    try:
+        f = _norm_fund(u)
+        sec = u.get("sector") or "Unknown"
+        st, al = VAL_STATS.get(sec) or {}, VAL_STATS.get("_all") or {}
+        out = {"sector": sec, "note": u.get("valuationNote") or None}
+        for m, k in VAL_METRICS:
+            v = f.get(k)
+            if v and v > 0:
+                out[m] = round(v, 2)
+                med = st.get(m) or al.get(m)
+                if med:
+                    out[m + "Median"] = round(med, 2)
+        quality = (f["roe"] is not None and f["roe"] > 0.15) or (f["revenueGrowth"] is not None and f["revenueGrowth"] > 0.15)
+        pts = valuation_points(f, sec, quality) if VAL_STATS else None
+        out["points"] = round(pts, 1) if pts is not None else None
+        return out
+    except Exception:
+        return None
+
+
+def recently_renamed(u, today, days=30):
+    """z187: the pipeline saw the company name behind this symbol change (renamed, or the symbol now belongs to someone
+    else - PARA went from Paramount to a micro-cap): its history and fundamentals don't describe one company, so it is
+    not opened for 30 days. Held positions are still managed."""
+    at = u.get("nameChangedAt")
+    if not at:
+        return False
+    try:
+        return (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(str(at)[:10], "%Y-%m-%d")).days <= days
+    except ValueError:
+        return False
 
 
 def _fund_engine(u):
@@ -1850,15 +2021,22 @@ def _fund_engine(u):
         if de is not None: pts += 18 if de < 0.5 else 8 if de < 1 else -5 if de < 2 else -20
         if curr is not None: pts += 12 if curr > 2 else 4 if curr > 1 else -18
         if cash is not None and debt is not None and cash > debt: pts += 12
-        if eq is not None and eq < 0: pts -= 25
+        if eq is not None and eq < 0:
+            # z187: negative book from buybacks at a cash-generating company (MCD, ABBV, SBUX) is a capital-return
+            # choice, not distress - a smaller deduction; with no profits or free cash flow it stays a red flag
+            cash_gen = (fcf is not None and fcf > 0) and (nm is None or nm > 0)
+            pts -= 8 if cash_gen else 25
         steps[3] = max(0.0, min(100.0, pts))
     else:
         steps[3] = None
 
     pe, pb, ps, rg = f["pe"], f["priceToBook"], f["priceToSales"], f["revenueGrowth"]
-    if pe is not None or pb is not None or ps is not None:
+    quality = (roe is not None and roe > 0.15) or (rg is not None and rg > 0.15)
+    rel = valuation_points(f, u.get("sector"), quality) if VAL_STATS else None
+    if rel is not None:
+        steps[4] = max(0.0, min(100.0, rel))                 # z187: sector-relative
+    elif pe is not None or pb is not None or ps is not None:
         pts = 50.0
-        quality = (roe is not None and roe > 0.15) or (rg is not None and rg > 0.15)
         if pe is not None and pe > 0:
             fair = 35 if quality else 20
             if pe < fair * 0.6: pts += 18
@@ -1868,7 +2046,7 @@ def _fund_engine(u):
         if ps is not None:
             if ps < 2: pts += 8
             elif ps > 12: pts -= 10
-        if pb is not None and pb < 1: pts += 10
+        if pb is not None and 0 < pb < 1: pts += 10           # z187: never for negative book (was "below book - value")
         steps[4] = max(0.0, min(100.0, pts))
     else:
         steps[4] = None
@@ -2442,6 +2620,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
     all_signed = []                                    # z186: the score distribution, logged - are there shorts to find?
     bear = []                                          # z186: (signed, ticker, what happened) for every name at the short bar
     bear_pool = []                                     # z186: tradable bearish ideas (bar applied after the scan)
+    renamed = []                                       # z187: the company behind the symbol changed - not traded for 30 days
     for tk, u in universe.items():
         if tk in held:
             continue
@@ -2452,6 +2631,9 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             continue
         if not u.get("scan", True):
             continue   # price-only book (TRAPP2-3 / TRAPP2-4): managed when held, never scanned
+        if recently_renamed(u, today):
+            renamed.append(f"{tk} (was '{u.get('nameWas')}')")
+            continue
         sc = score_symbol(tk, u, ctx)
         scanned += 1
         if sc is None:
@@ -2550,6 +2732,9 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         pq = lambda f: q[min(len(q) - 1, int(f * len(q)))]
         log(f"  scores: min {q[0]:+.2f} · 5% {pq(0.05):+.2f} · median {pq(0.5):+.2f} · 95% {pq(0.95):+.2f} · max {q[-1]:+.2f} · "
             f"{sum(1 for x in q if x <= short_bar)} at or below today's short bar, {sum(1 for x in q if x >= min_score)} at or above the long bar")
+    if renamed:
+        log(f"  {len(renamed)} not traded - the company behind the symbol changed in the last 30 days (renamed or reassigned): "
+            + ", ".join(renamed[:10]))
     if bear:
         why_n = {}
         for _, _, w in bear:
@@ -2858,6 +3043,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                       "throttle": rscale} if book is not None else None),
             "headcount": headcount_of(c["ticker"]),             # z151: context, not scored
             "filings": filings_of(c["ticker"]),                 # z158: 8-K flags, insiders, short selling - context
+            "valuation": valuation_card(universe.get(c["ticker"]) or {}),   # z187: the multiples it was judged on
         }
         if option and option.get("legs"):
             # z167: a vertical spread - two legs, one expiry; optionNet is the signed entry value per share
