@@ -21,9 +21,12 @@
 #  a net beta cap that depends on whether the regime call is dialed in (§1b), a cap on the
 #  new risk taken per session, a per-position loss cap, a drawdown throttle (smaller new trades while the book is
 #  below its high-water mark - it keeps trading, explore mode keeps collecting data) and a daily halt.
+#  z190: short sales need a single stock by every sign (fund_reason) and a KNOWN $2B+ market cap; a short the rule
+#  never allowed is unwound by the runner (RUNNER_UNWIND_UNSHORTABLE).
 # ============================================================
 import math
 import os
+import re
 
 
 def _envf(name, default):
@@ -52,6 +55,11 @@ DD_WINDOW = int(_envf("RUNNER_RISK_DD_WINDOW", 90))                # high-water 
 DD_STEPS = ((0.04, 1.00), (0.08, 0.70), (0.12, 0.50), (9.99, 0.35))   # drawdown -> scale on new risk
 MIN_SHORT_PRICE = _envf("RUNNER_RISK_MIN_SHORT_PX", 10)            # no short sales under $10 ...
 MIN_SHORT_CAP = _envf("RUNNER_RISK_MIN_SHORT_CAP", 2e9)            # ... or under a $2B market cap (borrow, squeezes)
+# z190: a fund is recognised by ANY sign of one. TRAPP2-1 (the macro book) lists only funds / ETPs among its US symbols
+# (plus foreign listings, FX, crypto, futures, indices); on 11-16 a throttled Yahoo answer blanked their profiles (no
+# name, isetf "false", no market cap) and the runner shorted GLD, SOXL (3x), TAN and WGMI as if they were stocks.
+FUND_REPOS = {r.strip() for r in os.environ.get("RUNNER_RISK_FUND_REPOS", "TRAPP2-1").split(",") if r.strip()}
+_LEVERAGED = re.compile(r"(?i)^(?=.*\b(?:etf|etn|shares|fund)\b).*\b(?:[1-4](?:\.\d+)?x|ultra(?:pro)?|inverse|leveraged|bull|bear)\b")
 VOL_WIN, BETA_WIN, CORR_WIN = 60, 500, 60
 
 
@@ -269,16 +277,36 @@ def size_shares(bankroll, conf, stop_pct, sig, scale=1.0, cap_notional=None):
     return notional, notional * eff, eff, why
 
 
+def fund_reason(u):
+    """Why a universe row is a fund / ETP and not a single stock, or "" (z190: any one sign is enough - the ETF flag,
+    the fund flag, a US symbol from the macro book, a leveraged / inverse product's name)."""
+    t = str(u.get("ticker") or "").upper()
+    if str(u.get("isetf") or "").lower() == "true":
+        return "a fund (ETF)"
+    if str(u.get("isfund") or "").lower() == "true":
+        return "a fund"
+    if t and "." not in t and str(u.get("repo") or "") in FUND_REPOS:
+        return f"an ETF / ETP from the macro book ({u.get('repo')})"
+    if _LEVERAGED.search(str(u.get("name") or "")):
+        return "a leveraged / inverse product"
+    return ""
+
+
 def shortable(u):
-    """A short sale needs a liquid, borrowable name: >= $10, >= $2B market cap, a stock (not a fund or a leveraged
-    product). Paper trading has no borrow desk; this keeps the shorts realistic."""
-    px, mc = u.get("price") or 0, u.get("marketcap")
+    """A short sale needs a liquid, borrowable single stock (§1d 3): not a fund or an ETP, >= $10, and a market cap we
+    KNOW is >= $2B (in USD - z190: an unknown cap no longer passes). Paper trading has no borrow desk; this keeps the
+    shorts realistic. A name that fails gets a put instead, when it has an option chain."""
+    why = fund_reason(u)
+    if why:
+        return False, f"{why} - no single-name short"
+    px = u.get("price") or 0
+    mc = u.get("marketcapUSD") if u.get("marketcapUSD") is not None else u.get("marketcap")
     if px < MIN_SHORT_PRICE:
         return False, f"price ${px:.2f} < ${MIN_SHORT_PRICE:.0f}"
-    if mc is not None and mc < MIN_SHORT_CAP:
+    if mc is None:
+        return False, "market cap unknown - can't confirm a $2B+ company"
+    if mc < MIN_SHORT_CAP:
         return False, f"market cap ${mc / 1e9:.1f}B < ${MIN_SHORT_CAP / 1e9:.0f}B"
-    if str(u.get("isetf") or "").lower() == "true":
-        return False, "a fund (no single-name short)"
     return True, ""
 
 
