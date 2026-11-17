@@ -4,7 +4,7 @@
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:04+00:00"
+   "fetchedAt": "2026-11-17T12:35:02+00:00"
   },
   "CCJ": {
    "splits": [],
@@ -15,7 +15,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:04+00:00"
+   "fetchedAt": "2026-11-17T12:35:02+00:00"
   },
   "UPS": {
    "splits": [],
@@ -35,16 +35,20 @@
     {
      "exDate": "2026-08-17",
      "amount": 1.64
+    },
+    {
+     "exDate": "2026-11-16",
+     "amount": 1.64
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:04+00:00"
+   "fetchedAt": "2026-11-17T12:35:02+00:00"
   },
   "BZFD": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:04+00:00"
+   "fetchedAt": "2026-11-17T12:35:02+00:00"
   },
   "NOC": {
    "splits": [],
@@ -67,7 +71,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:04+00:00"
+   "fetchedAt": "2026-11-17T12:35:02+00:00"
   },
   "PEG": {
    "splits": [],
@@ -90,19 +94,19 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:04+00:00"
+   "fetchedAt": "2026-11-17T12:35:02+00:00"
   },
   "ZF=F": {
    "splits": [],
    "dividends": [],
    "currency": null,
-   "fetchedAt": "2026-11-16T12:35:04+00:00"
+   "fetchedAt": "2026-11-17T12:35:02+00:00"
   },
   "FSLR": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:04+00:00"
+   "fetchedAt": "2026-11-17T12:35:02+00:00"
   },
   "SBLK": {
    "splits": [],
@@ -125,19 +129,19 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:04+00:00"
+   "fetchedAt": "2026-11-17T12:35:02+00:00"
   },
   "EU": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:04+00:00"
+   "fetchedAt": "2026-11-17T12:35:03+00:00"
   },
   "AAL": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:04+00:00"
+   "fetchedAt": "2026-11-17T12:35:03+00:00"
   },
   "UMC": {
    "splits": [],
@@ -148,7 +152,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:03+00:00"
   },
   "DELL": {
    "splits": [],
@@ -171,7 +175,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:03+00:00"
   },
   "TOELY": {
    "splits": [
@@ -188,7 +192,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:03+00:00"
   },
   "000660.KS": {
    "splits": [],
@@ -211,7 +215,7 @@
     }
    ],
    "currency": "KRW",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:03+00:00"
   },
   "000725.SZ": {
    "splits": [],
@@ -222,7 +226,7 @@
     }
    ],
    "currency": "CNY",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:03+00:00"
   },
   "MU": {
    "splits": [],
@@ -245,13 +249,13 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:03+00:00"
   },
   "ARM": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:03+00:00"
   },
   "BCAB": {
    "splits": [
@@ -263,19 +267,19 @@
    ],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:03+00:00"
   },
   "ZR=F": {
    "splits": [],
    "dividends": [],
    "currency": null,
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:03+00:00"
   },
   "INDO": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:04+00:00"
   },
   "3231.TW": {
    "splits": [],
@@ -286,7 +290,7 @@
     }
    ],
    "currency": "TWD",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:04+00:00"
   },
   "TSM": {
    "splits": [],
@@ -309,7 +313,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:04+00:00"
   },
   "LNVGY": {
    "splits": [],
@@ -320,7 +324,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:04+00:00"
   },
   "OXY": {
    "splits": [],
@@ -343,7 +347,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:04+00:00"
   },
   "PARA": {
    "splits": [
@@ -365,13 +369,13 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:05+00:00"
+   "fetchedAt": "2026-11-17T12:35:04+00:00"
   },
   "SOS": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:04+00:00"
   },
   "MPC": {
    "splits": [],
@@ -394,7 +398,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:04+00:00"
   },
   "VLO": {
    "splits": [],
@@ -417,7 +421,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:04+00:00"
   },
   "PSX": {
    "splits": [],
@@ -440,15 +444,11 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:04+00:00"
   },
   "SHEL": {
    "splits": [],
    "dividends": [
-    {
-     "exDate": "2025-11-14",
-     "amount": 0.716
-    },
     {
      "exDate": "2026-02-20",
      "amount": 0.744
@@ -467,7 +467,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:05+00:00"
   },
   "EOG": {
    "splits": [],
@@ -490,7 +490,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:05+00:00"
   },
   "ACN": {
    "splits": [],
@@ -509,7 +509,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:05+00:00"
   },
   "COP": {
    "splits": [],
@@ -529,10 +529,14 @@
     {
      "exDate": "2026-08-17",
      "amount": 0.84
+    },
+    {
+     "exDate": "2026-11-16",
+     "amount": 0.93
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:05+00:00"
   },
   "NEM": {
    "splits": [],
@@ -555,7 +559,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:05+00:00"
   },
   "CVX": {
    "splits": [],
@@ -578,7 +582,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:05+00:00"
   },
   "META": {
    "splits": [],
@@ -601,19 +605,19 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:05+00:00"
   },
   "SHOP": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:06+00:00"
   },
   "PLTR": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:06+00:00"
+   "fetchedAt": "2026-11-17T12:35:06+00:00"
   },
   "MSFT": {
    "splits": [],
@@ -636,74 +640,70 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:06+00:00"
   },
   "SSNLF": {
    "splits": [],
    "dividends": [
     {
      "exDate": "2025-12-29",
-     "amount": 0.424145
+     "amount": 0.423466
     },
     {
      "exDate": "2026-03-30",
-     "amount": 0.278767
+     "amount": 0.27832
     },
     {
      "exDate": "2026-06-29",
-     "amount": 0.280265
+     "amount": 0.279817
     },
     {
      "exDate": "2026-09-29",
-     "amount": 3.447862
+     "amount": 3.442342
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:06+00:00"
   },
   "GME": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:06+00:00"
   },
   "TEAM": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:06+00:00"
   },
   "GOGO": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:06+00:00"
   },
   "TTWO": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:06+00:00"
   },
   "SPHR": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:06+00:00"
   },
   "ALXO": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:06+00:00"
   },
   "XOM": {
    "splits": [],
    "dividends": [
-    {
-     "exDate": "2025-11-14",
-     "amount": 1.03
-    },
     {
      "exDate": "2026-02-12",
      "amount": 1.03
@@ -715,18 +715,18 @@
     {
      "exDate": "2026-08-17",
      "amount": 1.03
+    },
+    {
+     "exDate": "2026-11-16",
+     "amount": 1.07
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:06+00:00"
   },
   "BP": {
    "splits": [],
    "dividends": [
-    {
-     "exDate": "2025-11-14",
-     "amount": 0.499
-    },
     {
      "exDate": "2026-02-20",
      "amount": 0.499
@@ -745,7 +745,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:07+00:00"
   },
   "DVN": {
    "splits": [],
@@ -768,7 +768,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:07+00:00"
   },
   "AMGN": {
    "splits": [],
@@ -791,13 +791,13 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:07+00:00"
   },
   "ESTC": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:07+00:00"
+   "fetchedAt": "2026-11-17T12:35:07+00:00"
   },
   "OKE": {
    "splits": [],
@@ -820,7 +820,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:07+00:00"
   },
   "NVDA": {
    "splits": [],
@@ -843,19 +843,19 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:07+00:00"
   },
   "PBRG": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:07+00:00"
   },
   "BWET": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:07+00:00"
   },
   "A": {
    "splits": [],
@@ -878,7 +878,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:07+00:00"
   },
   "PFE": {
    "splits": [],
@@ -901,15 +901,11 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:08+00:00"
   },
   "LLY": {
    "splits": [],
    "dividends": [
-    {
-     "exDate": "2025-11-14",
-     "amount": 1.5
-    },
     {
      "exDate": "2026-02-13",
      "amount": 1.73
@@ -928,7 +924,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:08+00:00"
   },
   "REGN": {
    "splits": [],
@@ -951,13 +947,13 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:08+00:00"
   },
   "VRTX": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:08+00:00"
   },
   "NUE": {
    "splits": [],
@@ -980,7 +976,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:08+00:00"
   },
   "SQQQ": {
    "splits": [
@@ -1009,7 +1005,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:08+00:00"
   },
   "ZSL": {
    "splits": [
@@ -1021,7 +1017,7 @@
    ],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:08+00:00"
   },
   "AZN": {
    "splits": [
@@ -1038,13 +1034,13 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:08+00:00"
   },
   "IDXX": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:08+00:00"
+   "fetchedAt": "2026-11-17T12:35:08+00:00"
   },
   "NDAQ": {
    "splits": [],
@@ -1067,7 +1063,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:09+00:00"
+   "fetchedAt": "2026-11-17T12:35:09+00:00"
   },
   "DIS": {
    "splits": [],
@@ -1082,7 +1078,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:09+00:00"
+   "fetchedAt": "2026-11-17T12:35:09+00:00"
   },
   "SPXS": {
    "splits": [],
@@ -1105,7 +1101,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:09+00:00"
+   "fetchedAt": "2026-11-17T12:35:09+00:00"
   },
   "PG": {
    "splits": [],
@@ -1128,7 +1124,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:09+00:00"
+   "fetchedAt": "2026-11-17T12:35:09+00:00"
   },
   "CBOE": {
    "splits": [],
@@ -1147,7 +1143,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:09+00:00"
+   "fetchedAt": "2026-11-17T12:35:09+00:00"
   },
   "IPAR": {
    "splits": [],
@@ -1170,7 +1166,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:09+00:00"
+   "fetchedAt": "2026-11-17T12:35:09+00:00"
   },
   "PPG": {
    "splits": [],
@@ -1193,13 +1189,13 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:09+00:00"
+   "fetchedAt": "2026-11-17T12:35:09+00:00"
   },
   "BRK-B": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:09+00:00"
+   "fetchedAt": "2026-11-17T12:35:09+00:00"
   },
   "KO": {
    "splits": [],
@@ -1222,13 +1218,13 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:09+00:00"
+   "fetchedAt": "2026-11-17T12:35:10+00:00"
   },
   "EW": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:09+00:00"
+   "fetchedAt": "2026-11-17T12:35:10+00:00"
   },
   "JPM": {
    "splits": [],
@@ -1251,7 +1247,7 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T12:35:09+00:00"
+   "fetchedAt": "2026-11-17T12:35:10+00:00"
   },
   "SOXL": {
    "splits": [],
@@ -1262,32 +1258,32 @@
     }
    ],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T15:11:15+00:00"
+   "fetchedAt": "2026-11-17T12:35:10+00:00"
   },
   "WGMI": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T15:11:15+00:00"
+   "fetchedAt": "2026-11-17T12:35:10+00:00"
   },
   "TAN": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T15:11:15+00:00"
+   "fetchedAt": "2026-11-17T12:35:10+00:00"
   },
   "BEAM": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T15:11:16+00:00"
+   "fetchedAt": "2026-11-17T12:35:10+00:00"
   },
   "GLD": {
    "splits": [],
    "dividends": [],
    "currency": "USD",
-   "fetchedAt": "2026-11-16T15:11:16+00:00"
+   "fetchedAt": "2026-11-17T12:35:10+00:00"
   }
  },
- "asOf": "2026-11-16T15:11:16+00:00"
+ "asOf": "2026-11-17T12:35:10+00:00"
 }
