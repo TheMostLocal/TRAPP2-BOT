@@ -1283,7 +1283,19 @@
    "dividends": [],
    "currency": "USD",
    "fetchedAt": "2026-11-17T12:35:10+00:00"
+  },
+  "CC=F": {
+   "splits": [],
+   "dividends": [],
+   "currency": null,
+   "fetchedAt": "2026-11-17T15:35:01+00:00"
+  },
+  "HO=F": {
+   "splits": [],
+   "dividends": [],
+   "currency": null,
+   "fetchedAt": "2026-11-17T15:35:01+00:00"
   }
  },
- "asOf": "2026-11-17T12:35:10+00:00"
+ "asOf": "2026-11-17T15:35:01+00:00"
 }
