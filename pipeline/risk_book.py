@@ -23,6 +23,8 @@
 #  below its high-water mark - it keeps trading, explore mode keeps collecting data) and a daily halt.
 #  z190: short sales need a single stock by every sign (fund_reason) and a KNOWN $2B+ market cap; a short the rule
 #  never allowed is unwound by the runner (RUNNER_UNWIND_UNSHORTABLE).
+#  z192: etp_exposure() - a leveraged / inverse product's signed daily leverage and what it tracks, and etp_drag() -
+#  what holding it past one session costs (the runner signs its market signals and manages it session by session).
 # ============================================================
 import math
 import os
@@ -290,6 +292,76 @@ def fund_reason(u):
     if _LEVERAGED.search(str(u.get("name") or "")):
         return "a leveraged / inverse product"
     return ""
+
+
+# ------------------------------------------------------------------------------------------- z192: ETPs ----
+# A leveraged / inverse exchange-traded product resets its exposure every session: SQQQ is -3x the Nasdaq-100 for ONE
+# day. Held longer it lags L x the move by the volatility drag, about (L^2 - L) / 2 x sigma^2 a session (sigma = the
+# underlying's daily vol: SQQQ ~0.10 % a session at a 1.3 % Nasdaq, ~2 % a month) - a hold needs a live signal every
+# session. Its market-wide signals carry its sign (a risk-off tape is a buy signal for a bear fund), and it has no
+# company fundamentals (before z192 a bear fund's T-bill income scored SQQQ +0.5 "fundamentals" and +0.5 "health").
+_ETP_KNOWN = {   # (signed daily leverage, what it tracks) - names can be blank on a throttled night
+    "SQQQ": (-3, "equity"), "TQQQ": (3, "equity"), "QID": (-2, "equity"), "QLD": (2, "equity"), "PSQ": (-1, "equity"),
+    "SPXS": (-3, "equity"), "SPXL": (3, "equity"), "SPXU": (-3, "equity"), "UPRO": (3, "equity"),
+    "SDS": (-2, "equity"), "SSO": (2, "equity"), "SH": (-1, "equity"),
+    "SDOW": (-3, "equity"), "UDOW": (3, "equity"), "DXD": (-2, "equity"), "DDM": (2, "equity"), "DOG": (-1, "equity"),
+    "TZA": (-3, "equity"), "TNA": (3, "equity"), "TWM": (-2, "equity"), "UWM": (2, "equity"), "RWM": (-1, "equity"),
+    "SOXS": (-3, "equity"), "SOXL": (3, "equity"), "TECS": (-3, "equity"), "TECL": (3, "equity"),
+    "FAZ": (-3, "equity"), "FAS": (3, "equity"), "LABD": (-3, "equity"), "LABU": (3, "equity"),
+    "YANG": (-3, "equity"), "YINN": (3, "equity"), "NUGT": (2, "equity"), "DUST": (-2, "equity"),
+    "JNUG": (2, "equity"), "JDST": (-2, "equity"),
+    "TMF": (3, "rates"), "TMV": (-3, "rates"), "TBT": (-2, "rates"), "UBT": (2, "rates"),
+    "UCO": (2, "commodity"), "SCO": (-2, "commodity"), "BOIL": (2, "commodity"), "KOLD": (-2, "commodity"),
+    "UGL": (2, "commodity"), "GLL": (-2, "commodity"), "AGQ": (2, "commodity"), "ZSL": (-2, "commodity"),
+    "UVXY": (1.5, "volatility"), "SVXY": (-0.5, "volatility"),
+}
+_FUND_WORD = re.compile(r"(?i)\b(?:etf|etn|fund|trust)\b|shares\b")          # "ProShares", "Direxion ... Shares", "... ETF"
+_MULT = re.compile(r"(?i)(?<![\d.])([1-4](?:\.\d+)?)\s*x\b")                 # 2X, 3x, 1.5x
+_INVERSE = re.compile(r"(?i)\bultra\s*(?:pro\s*)?short|\bbear\b|\binverse\b|(?<!ultra-)(?<!ultra )\bshort\b"
+                      r"(?![\s-]*(?:term|duration|maturity|dated|income|bond|treasury|government|corporate|muni))")
+_UNDERLYING = (("volatility", re.compile(r"(?i)\bvix\b|volatility")),
+               ("rates", re.compile(r"(?i)treasur|\bbonds?\b|\byear\b|\btips\b|high yield")),
+               ("commodity", re.compile(r"(?i)crude|\bwti\b|\bbrent\b|natural gas|\bgold\b(?!\s*miners)|\bsilver\b|copper|commodit")),
+               ("currency", re.compile(r"(?i)\bdollar\b|\beuro\b|\byen\b|currenc")))
+
+
+def etp_exposure(u):
+    """A leveraged / inverse ETP's daily exposure: {"lev": signed leverage, "underlying": equity | rates | commodity |
+    volatility | currency, "basis": table | name}, or None for a stock or a plain (1x long) fund. Known symbols first,
+    then the name - only a fund's name (ProShares' Ultra = 2x, UltraPro = 3x; else an explicit multiple; a short /
+    bear / inverse fund is -1x unless it says more; "Short-Term", "Ultra-Short Income" are durations, not shorts)."""
+    t = str(u.get("ticker") or "").upper()
+    if t in _ETP_KNOWN:
+        lev, und = _ETP_KNOWN[t]
+        return {"lev": float(lev), "underlying": und, "basis": "table"}
+    name = str(u.get("name") or "")
+    if not name or not (fund_reason(u) or _FUND_WORD.search(name)):
+        return None
+    m = _MULT.search(name)
+    pro = "proshares" in name.lower()
+    mag = float(m.group(1)) if m else (3.0 if pro and re.search(r"(?i)\bultra\s*pro", name) else
+                                       2.0 if pro and re.search(r"(?i)\bultra", name) else None)
+    inverse = bool(_INVERSE.search(name))
+    if mag is None:
+        if not inverse:
+            return None
+        mag = 1.0
+    if not inverse and mag == 1.0:
+        return None                                    # a plain 1x long fund
+    und = next((k for k, rx in _UNDERLYING if rx.search(name)), "equity")
+    return {"lev": -mag if inverse else mag, "underlying": und, "basis": "name"}
+
+
+def etp_drag(lev, etp_daily_vol):
+    """The volatility drag of holding a daily-reset product one more session, as a fraction: (L^2 - L) / 2 x the
+    underlying's variance, the underlying's vol read off the product's own (sigma_etp / |L|)."""
+    try:
+        lev, v = float(lev), float(etp_daily_vol)
+    except (TypeError, ValueError):
+        return None
+    if not lev or not math.isfinite(v) or v <= 0:
+        return None
+    return (lev * lev - lev) / 2.0 * (v / abs(lev)) ** 2
 
 
 def shortable(u):
