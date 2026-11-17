@@ -213,6 +213,14 @@ CORE_TRIM_FRAC = _envf("RUNNER_CORE_TRIM_FRAC", 25) / 100.0 # trim this fraction
 
 LONG_TERM_SIGNALS = ("fundamentals", "researchGrade", "health", "peerGrade", "regimeGrade", "fed", "crossAsset")
 SWING_SIGNALS     = ("trend", "momentum", "meanReversion", "optionsIV", "optionsMarket")
+# z192 (owner, 11-17: "the bot needs to learn from every trade"; leveraged / inverse ETPs stay tradable as long as
+# signals open and close them). A daily-reset product holds only while its signal does: re-scored in its direction
+# below this, past its minimum hold, it is closed ("signal-faded") - every session held costs the volatility drag.
+ETP_HOLD_SCORE = _envf("RUNNER_ETP_HOLD_SCORE", 0.10)
+COMPANY_SIGNALS = ("fundamentals", "health", "researchGrade", "peerGrade", "catalyst")   # a fund has none of these
+ETP_MARKET_SIGNALS = ("crossAsset", "optionsMarket")      # market-wide: an ETP carries them in its own direction
+ETP_SECTOR_SIGNALS = ("regimeGrade", "fed")                # sector / beta tilts: not defined for an ETP
+SIGNAL_BASIS = "z192"                                      # components recorded fund-clean and exposure-signed
 POSITION_PCT = _envf("RUNNER_POSITION_PCT", _MODE["pos_pct"]) / 100.0
 CASH_RESERVE_PCT = _envf("RUNNER_CASH_RESERVE_PCT", _MODE["reserve"]) / 100.0
 MIN_SCORE = _envf("RUNNER_MIN_SCORE", _MODE["min_score"])
@@ -2110,18 +2118,26 @@ def score_symbol(tk, u, ctx):
     if not closes:
         return None
     comps = score_ticker(closes, ctx["weights"])
-    # Fundamental core (reasoning-chain conviction + health) + research grade.
-    fe = _fund_engine(u)
-    if fe.get("conviction") is not None:
-        comps["fundamentals"] = max(-1.0, min(1.0, (fe["conviction"] - 50) / 50))
-    if fe.get("health") is not None:
-        comps["health"] = max(-1.0, min(1.0, (fe["health"] - 50) / 50))
-    g = (ctx.get("grades") or {}).get(tk)
-    if g and g.get("gradeScore") is not None:
-        comps["researchGrade"] = max(-1.0, min(1.0, (g["gradeScore"] - 50) / 50))
-    pg = peer_grade_signal(tk, u.get("sector"), ctx["peer_ranks"])
-    if pg is not None:
-        comps["peerGrade"] = pg
+    # z192: a fund / ETP has no company fundamentals - an ETF's distribution yield alone made the reasoning chain score
+    # SQQQ +0.50 "fundamentals" and +0.50 "health" (a bear fund's T-bill income), and the horizon read it as a slow,
+    # long-term thesis ("core", 8-month plan). Funds are judged on their own chart and the market signals.
+    fund = rb.fund_reason(u)
+    etp = rb.etp_exposure(u)
+    if etp:
+        fund = fund or "a leveraged / inverse product"
+    if not fund:
+        # Fundamental core (reasoning-chain conviction + health) + research grade.
+        fe = _fund_engine(u)
+        if fe.get("conviction") is not None:
+            comps["fundamentals"] = max(-1.0, min(1.0, (fe["conviction"] - 50) / 50))
+        if fe.get("health") is not None:
+            comps["health"] = max(-1.0, min(1.0, (fe["health"] - 50) / 50))
+        g = (ctx.get("grades") or {}).get(tk)
+        if g and g.get("gradeScore") is not None:
+            comps["researchGrade"] = max(-1.0, min(1.0, (g["gradeScore"] - 50) / 50))
+        pg = peer_grade_signal(tk, u.get("sector"), ctx["peer_ranks"])
+        if pg is not None:
+            comps["peerGrade"] = pg
     rg = None if ctx.get("regime_agnostic") else regime_grade_signal(u.get("sector"), u.get("beta"), ctx["mode"], ctx["quad"])
     if rg is not None:
         comps["regimeGrade"] = rg
@@ -2143,10 +2159,203 @@ def score_symbol(tk, u, ctx):
         comps["pattern"] = pv
     # z138: the catalyst - the next earnings report and how this name has reported (beat rate,
     # average surprise). A signal in the blend at the default weight; the retrain moves it.
-    cs = tb.catalyst_signal(tb.catalyst_info(_CAL, tk, ctx.get("today") or datetime.now(timezone.utc).strftime("%Y-%m-%d")))
+    cs = None if fund else tb.catalyst_signal(tb.catalyst_info(_CAL, tk, ctx.get("today") or datetime.now(timezone.utc).strftime("%Y-%m-%d")))
     if cs is not None and abs(cs) > 0.03:
         comps["catalyst"] = cs
-    return {"comps": comps, "signed": blend_score(comps, ctx["weights"], ctx["weight_mods"])}
+    if etp:
+        _etp_sign_market(comps, etp, ctx.get("xa"))
+    return {"comps": comps, "signed": blend_score(comps, ctx["weights"], ctx["weight_mods"]), "etp": etp}
+
+
+def _market_cross_asset(xa):
+    """The broad-market cross-asset read (global indices less the safe-haven pull) - cross_asset_for_sector's default."""
+    if not xa:
+        return None
+    idx, sh = xa.get("indices"), xa.get("safeHaven")
+    if idx is None and sh is None:
+        return None
+    return max(-1.0, min(1.0, (idx or 0) - 0.5 * (sh or 0)))
+
+
+def _etp_sign_market(comps, etp, xa):
+    """z192: a leveraged / inverse ETP's market-wide signals in ITS direction. A risk-off tape is a buy signal for a
+    bear fund: before z192 SPXS (-3x S&P 500) counted cross-asset -1.00 and options-market -0.44 against its own long.
+    Equity products take the broad-market read times the sign of their leverage; sector / beta tilts (regime, Fed) are
+    not defined for them; a rates / commodity / volatility product takes no equity-market signal."""
+    for k in ETP_SECTOR_SIGNALS + ("crossAsset",):
+        comps.pop(k, None)
+    sgn = 1.0 if etp["lev"] > 0 else -1.0
+    if etp.get("underlying") != "equity":
+        comps.pop("optionsMarket", None)
+        return comps
+    mkt = _market_cross_asset(xa)
+    if mkt is not None:
+        comps["crossAsset"] = round(sgn * mkt, 3)
+    if comps.get("optionsMarket") is not None:
+        comps["optionsMarket"] = round(sgn * comps["optionsMarket"], 3)
+    return comps
+
+
+# ------------------------------------------------------------------------------------------- z192: learning ----
+# The bot learns from EVERY closed trade (owner, 11-17). Before z192 the server bot never did: learnedWeights stayed {}
+# (every signal at 1.0) and signalScores / styleScores were an app export frozen at 8 trades - the trades were recorded,
+# nothing was learned from them. retrain() REPLAYS the whole journal in exit order on each pass - so the weights are a
+# pure function of the trades (reproducible, and a restated P/L re-teaches) - with the app's botRetrain rule: a signal
+# that leaned the trade's way on a winner is trusted more, on a loser less (x(1 +/- 0.05 x |signal|), kept in
+# 0.25..4 - a signal is never removed nor dominant). A flat trade is neither a win nor a loss (the win-rate rule); a
+# regime signal learns only when the call was dialed in and right (z93); an exit the strategy didn't choose (a rule
+# unwind) teaches at half weight; a trade without recorded signals (app era) teaches the style / exit statistics.
+LEARN_RATE = _envf("RUNNER_LEARN_RATE", 0.05)
+LEARN_MIN, LEARN_MAX = 0.25, 4.0
+LEARN_FORCED = _envf("RUNNER_LEARN_FORCED", 0.5)
+FORCED_EXITS = ("not-shortable",)
+REGIME_SIGNALS = ("regimeGrade", "regime", "quad")
+
+
+def _trade_pl(t):
+    """What the trade put into the bankroll - exit P/L and its trims (the ledger's and the win rate's number)."""
+    return round(ts.exit_realized(t) + ts.trim_total(t), 2)
+
+
+def _lesson_components(t, universe=None):
+    """The signals a closed trade teaches, as they should have read at entry. A z192+ trade recorded them clean; an
+    older one is cleaned here: a fund's company signals dropped, an ETP's market signals put in its direction."""
+    comps = {}
+    for k, v in (t.get("components") or {}).items():
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(v) and v != 0:
+            comps[k] = v
+    if not comps or t.get("signalBasis") == SIGNAL_BASIS:
+        return comps, []
+    tk = str(t.get("ticker") or "").upper()
+    u = dict((universe or {}).get(tk) or {})
+    u.setdefault("ticker", tk)
+    if not u.get("name"):
+        u["name"] = t.get("name")
+    etp = rb.etp_exposure(u)
+    notes = []
+    if rb.fund_reason(u) or etp:
+        gone = [k for k in COMPANY_SIGNALS if k in comps]
+        for k in gone:
+            comps.pop(k)
+        if gone:
+            notes.append("fund: no company signals (" + ", ".join(gone) + ")")
+    if etp:
+        sgn = 1.0 if etp["lev"] > 0 else -1.0
+        gone = [k for k in ETP_SECTOR_SIGNALS if k in comps]
+        for k in gone:
+            comps.pop(k)
+        for k in ETP_MARKET_SIGNALS:
+            if k in comps:
+                if etp.get("underlying") != "equity":
+                    comps.pop(k)
+                    gone.append(k)
+                elif sgn < 0:
+                    comps[k] = -comps[k]
+        notes.append(f"{etp['lev']:+g}x {etp.get('underlying')} ETP: market signals in its direction"
+                     + (f", {', '.join(gone)} dropped" if gone else ""))
+    return comps, notes
+
+
+def retrain(state, universe=None, now_iso=None):
+    """Replay every closed trade (exit order) into learnedWeights; stamp each trade's lesson; summarise in
+    state["learning"]. Idempotent - the same journal gives the same weights."""
+    def _key(t):
+        return (str(t.get("exitAt") or t.get("exitDate") or ""), str(t.get("entryAt") or t.get("entryDate") or ""), str(t.get("id") or ""))
+    closed = sorted((t for t in trades_list(state) if t.get("status") == "closed"), key=_key)
+    w = {}
+    tally = {"closed": len(closed), "taught": 0, "flat": 0, "noSignals": 0, "forced": 0, "nudges": 0}
+    for t in closed:
+        pl = _trade_pl(t)
+        verdict = "win" if pl > 0 else ("loss" if pl < 0 else "flat")
+        comps, notes = _lesson_components(t, universe)
+        forced = str(t.get("exitReason") or "").split(" ")[0] in FORCED_EXITS
+        kw = LEARN_FORCED if forced else 1.0
+        rc = t.get("regimeContext") if isinstance(t.get("regimeContext"), dict) else {}
+        regime_ok = bool(rc) and rc.get("dialedIn") is True and t.get("regimeCallCorrect") is not False
+        dir_sign = -1 if t.get("direction") == "short" else 1
+        nudges = {}
+        if verdict != "flat":
+            for k, v in sorted(comps.items()):
+                if k in REGIME_SIGNALS and not regime_ok:
+                    continue
+                agreed = (v > 0) == (dir_sign > 0)
+                d = (1 if (verdict == "win") == agreed else -1) * LEARN_RATE * kw * min(1.0, abs(v))
+                w[k] = max(LEARN_MIN, min(LEARN_MAX, w.get(k, 1.0) * (1 + d)))
+                nudges[k] = round(d, 4)
+        if not comps:
+            tally["noSignals"] += 1
+            notes = notes + ["no signals recorded at entry - teaches the style / exit statistics only"]
+        elif verdict == "flat":
+            tally["flat"] += 1
+        else:
+            tally["taught"] += 1
+        tally["forced"] += 1 if forced else 0
+        tally["nudges"] += len(nudges)
+        t["lesson"] = {"verdict": verdict, "pl": pl, "weight": kw, "signals": {k: round(v, 3) for k, v in sorted(comps.items())},
+                       "nudges": nudges, "notes": notes}
+    lw = state.get("learnedWeights") if isinstance(state.get("learnedWeights"), dict) else {}
+    before = dict(lw)
+    lw.clear()
+    lw.update({k: round(v, 4) for k, v in sorted(w.items())})
+    state["learnedWeights"] = lw
+    ranked = sorted(lw.items(), key=lambda kv: kv[1])
+    state["learning"] = dict(tally, **{
+        "rule": "replay every closed trade: x(1 +/- %g x |signal|) toward signals that leaned the winning way; flat = no lesson; "
+                "regime signals only when dialed in and right; forced exits x%g; weights kept in %g..%g" % (LEARN_RATE, LEARN_FORCED, LEARN_MIN, LEARN_MAX),
+        "rate": LEARN_RATE, "bounds": [LEARN_MIN, LEARN_MAX], "forcedWeight": LEARN_FORCED,
+        "at": now_iso or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "weakest": [[k, v] for k, v in ranked[:3]], "strongest": [[k, v] for k, v in ranked[::-1][:3]],
+        "changed": sorted(k for k in set(before) | set(lw) if abs(before.get(k, 1.0) - lw.get(k, 1.0)) > 1e-9)})
+    return state["learning"]
+
+
+def learning_rollups(state, universe=None):
+    """signalScores / styleScores from the journal (the app's rollup: a signal's win rate when it leaned the trade's
+    way, decisive trades only; a style's win rate and P/L)."""
+    w = state.get("learnedWeights") if isinstance(state.get("learnedWeights"), dict) else {}
+    sig, sty = {}, {}
+    for t in trades_list(state):
+        if t.get("status") != "closed":
+            continue
+        pl = _trade_pl(t)
+        s = sty.setdefault(str(t.get("style") or "other"), {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0})
+        s["trades"] += 1
+        s["wins"] += 1 if pl > 0 else 0
+        s["losses"] += 1 if pl < 0 else 0
+        s["pnl"] += pl
+        if pl == 0:
+            continue
+        dir_sign = -1 if t.get("direction") == "short" else 1
+        comps, _ = _lesson_components(t, universe)
+        for k, v in comps.items():
+            p = sig.setdefault(k, {"trades": 0, "wins": 0, "lean": 0, "leanWon": 0})
+            p["trades"] += 1
+            p["wins"] += 1 if pl > 0 else 0
+            if (v > 0) == (dir_sign > 0):
+                p["lean"] += 1
+                p["leanWon"] += 1 if pl > 0 else 0
+    state["signalScores"] = sorted(({"signal": k, "trades": p["trades"], "leanN": p["lean"],
+                                     "winRateWhenLeaning": round(p["leanWon"] / p["lean"], 3) if p["lean"] else None,
+                                     "currentWeight": round(float(w.get(k, 1.0)), 3)} for k, p in sig.items()),
+                                   key=lambda x: -(x["winRateWhenLeaning"] or 0))
+    state["styleScores"] = sorted(({"style": k, "trades": s["trades"],
+                                    "winRate": round(s["wins"] / (s["wins"] + s["losses"]), 3) if (s["wins"] + s["losses"]) else None,
+                                    "totalPnl": round(s["pnl"], 2)} for k, s in sty.items()), key=lambda x: -x["totalPnl"])
+
+
+def log_learning(state):
+    lr = state.get("learning") or {}
+    if not lr:
+        return
+    fmt = lambda xs: ", ".join(f"{k} x{v:.2f}" for k, v in xs) or "-"
+    log(f"learning: {lr.get('closed')} closed trades replayed - {lr.get('taught')} taught, {lr.get('flat')} flat, "
+        f"{lr.get('noSignals')} without signals, {lr.get('forced')} forced (x{lr.get('forcedWeight')}) · "
+        f"most trusted {fmt(lr.get('strongest') or [])} · least {fmt(lr.get('weakest') or [])}"
+        + (f" · moved this pass: {', '.join(lr['changed'][:6])}" if lr.get("changed") else ""))
 
 
 def compute_confidence(comps, signed):
@@ -2334,6 +2543,24 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
 
         aligned_now = (signed_now * direction) if signed_now is not None else None
         exit_reason = None
+        # z192: a daily-reset leveraged / inverse product is a session-by-session signal trade - never a core / long
+        # hold. Opened before z192 (SQQQ, SPXS: "core", a 15-session minimum hold, an 8-month plan) it is re-planned
+        # once on the short horizon; the old plan is kept in pos["etp"]["replannedFrom"].
+        etp = rb.etp_exposure(u) if (pos.get("instrument") or "shares") == "shares" else None
+        etp_note = ""
+        if etp:
+            if _replan_etp(pos, etp, today):
+                rf = pos["etp"]["replannedFrom"]
+                was = (rf.get("horizonType") or rf.get("horizonClass") or "unplanned") + \
+                    (f", a {rf['minHoldDays']}-session minimum hold" if rf.get("minHoldDays") else "")
+                log(f"  {pos.get('ticker')}: daily-reset {etp['lev']:+g}x product re-planned (z192) - short horizon, minimum hold "
+                    f"{pos.get('minHoldDays')} sessions, stop ${pos.get('stopPrice')}, target ${pos.get('targetPrice')}, "
+                    f"held while its signal is >= {ETP_HOLD_SCORE:.2f} (was {was})")
+            htype = pos.get("horizonType") or "swing"
+            vol_a = tb.realized_vol(load_history(pos.get("ticker"), u.get("repo")) or [])
+            drag = rb.etp_drag(etp["lev"], vol_a / math.sqrt(252)) if vol_a else None
+            pos["etp"]["dragPerSession"] = round(drag, 6) if drag is not None else None
+            etp_note = f"daily-reset {etp['lev']:+g}x" + (f", drag ~{drag * 100:.2f} %/session" if drag is not None else "")
         # z138: the position's plan - sessions held, the minimum hold, the catalyst ahead
         days_held = tb.sessions_between(pos.get("entryDate"), today, mh.day_status)
         min_hold = int(pos.get("minHoldDays") or 0)
@@ -2476,6 +2703,9 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
                 exit_reason = "target"
             elif aligned_now is not None and aligned_now <= -CORE_EXIT_SCORE:
                 exit_reason = "thesis-break"
+            elif etp and aligned_now is not None and aligned_now < ETP_HOLD_SCORE:
+                # z192: a daily-reset product decays every session it's held - it stays only while its signal does
+                exit_reason = "signal-faded"
             elif is_alt and ctx is not None and ctx.get("research") is not None and \
                     _alt_research_against(pos, u, ctx, today):
                 exit_reason = "research-break"
@@ -2534,6 +2764,9 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
             decision, why = "trim", f"tier {pos.get('trimTier')} at {ret * 100:+.1f}% - riding the rest"
         elif in_hold:
             decision, why = "hold", f"minimum hold ({days_held}/{min_hold} sessions) - only a −{hold_disaster:.0%} move closes it"
+        elif etp:
+            decision, why = "hold", (f"{etp_note}: held while its signal is >= {ETP_HOLD_SCORE:.2f} in its direction"
+                                     + (f" (now {aligned_now:+.2f})" if aligned_now is not None else " (not re-scored this pass)"))
         elif aligned_now is not None and aligned_now < MIN_SCORE:
             decision, why = "hold", f"signal faded to {aligned_now:+.2f} - exits at the stop / target or the {pos.get('horizonDaysPlanned') or pos.get('horizonDays') or '—'}-session horizon"
         else:
@@ -2550,6 +2783,33 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
     for tk, sh, r, tier in trimmed_now:
         log(f"  trimmed {tk} {sh:g} sh @tier{tier} -> locked ${r:,.2f}")
     return closed_now
+
+
+def _replan_etp(pos, etp, today):
+    """z192: record the product's exposure on the position and put it on the short horizon (once). True if re-planned."""
+    rec = pos.get("etp") if isinstance(pos.get("etp"), dict) else {}
+    rec.update({"lev": etp["lev"], "underlying": etp.get("underlying"), "basis": etp.get("basis")})
+    pos["etp"] = rec
+    if tb.horizon_class(pos) == "short" and pos.get("horizonType") == "swing":
+        return False
+    hz = tb.HZ["short"]
+    entry = _f(pos.get("entryPrice"))
+    is_short = pos.get("direction") == "short"
+    rec["replannedFrom"] = {k: pos.get(k) for k in ("horizonClass", "horizonType", "minHoldDays", "horizonDaysPlanned",
+                                                    "horizonDays", "stopPrice", "targetPrice", "plannedExitBy")}
+    rec["replannedAt"] = today
+    pos["horizonClass"], pos["horizonType"] = "short", "swing"
+    pos["minHoldDays"] = min(int(pos.get("minHoldDays") or hz["min_hold"]), hz["min_hold"])
+    pos["horizonDaysPlanned"] = pos["horizonDays"] = hz["days"]
+    if entry:
+        pos["stopPrice"] = round(entry * ((1 + hz["stop"]) if is_short else (1 - hz["stop"])), 4)
+        pos["targetPrice"] = round(entry * ((1 - hz["target"]) if is_short else (1 + hz["target"])), 4)
+    ed = tb._d(pos.get("entryDate"))
+    if ed:
+        pos["plannedExitBy"] = (ed + timedelta(days=round(hz["days"] * 7 / 5))).strftime("%Y-%m-%d")
+    pos["horizonReason"] = (f"daily-reset {etp['lev']:+g}x product (re-planned z192): short horizon, held only while its "
+                            f"signal is >= {ETP_HOLD_SCORE:.2f} in its direction")
+    return True
 
 
 def _alt_research_against(pos, u, ctx, today):
@@ -2703,7 +2963,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                                "components": comps, "confidence": conf, "triggers": trigs,
                                "price": u["price"], "sector": u["sector"], "name": u["name"],
                                "priceLocal": u.get("priceLocal"), "currency": u.get("currency"), "fxRate": u.get("fxRate"),
-                               "entryReason": entry_reason})
+                               "entryReason": entry_reason, "etp": sc.get("etp")})
         elif signed <= SHORT_FLOOR and len(trigs) < MIN_TRIGGERS:
             if signed <= SHORT_SCORE:
                 bear.append((signed, tk, "no bearish trigger fired"))
@@ -2720,7 +2980,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                               "components": comps, "confidence": conf, "triggers": trigs,
                               "price": u["price"], "sector": u["sector"], "name": u["name"],
                               "priceLocal": u.get("priceLocal"), "currency": u.get("currency"), "fxRate": u.get("fxRate"),
-                              "putOnly": not can_short, "putWhy": short_why})
+                              "putOnly": not can_short, "putWhy": short_why, "etp": sc.get("etp")})
     # z186: the session's short bar - the absolute bar, or the bottom SHORT_PCTL of today's scores (never above
     # SHORT_FLOOR): the weakest names a long/short book would short, not only the broken ones
     short_bar = SHORT_SCORE
@@ -2846,6 +3106,11 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         hclass, h_why, steered = tb.choose_horizon(conf, lean, cat, c.get("direction"), mix, CORE_CONF)
         if alt:
             hclass, h_why, steered = "short", "research-driven alt trade (tactical)", False
+        elif c.get("etp"):
+            # z192: its exposure resets every session and decays with volatility - a session-by-session signal trade
+            htype, hclass, steered = "swing", "short", False
+            h_why = (f"daily-reset {c['etp']['lev']:+g}x product: short horizon, held only while its signal is "
+                     f">= {ETP_HOLD_SCORE:.2f} in its direction")
         cell = f"{c.get('direction')}|{hclass}"
         option = None
         use_hedge = False
@@ -3029,6 +3294,8 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             "conviction": round(c["score"] if not is_short else -c["score"], 3),
             "confidence": round(conf, 3), "longTermLean": lean,
             "components": {k: round(v, 3) for k, v in c["components"].items()},
+            "signalBasis": SIGNAL_BASIS,                        # z192: fund-clean, exposure-signed - taught as recorded
+            "etp": c.get("etp"),                                # z192: a leveraged / inverse product's exposure
             "topDrivers": trigs,
             "signalsThatHelped": [t["signal"] for t in trigs],
             "rationale": [f"{htype.upper()} · conf {conf:.2f} · score {c['score']:.2f}. Triggers: " +
@@ -3296,6 +3563,10 @@ def recompute(state, universe, today):
         ws = min(by_style.items(), key=lambda x: sum(x[1]))
         tk.append(f"Weakest style: {ws[0]} (${sum(ws[1]):,.0f} over {len(ws[1])} trades).")
     state["takeaways"] = tk
+    try:                                       # z192: signal / style scores from the journal (were frozen at 8 trades)
+        learning_rollups(state, universe)
+    except Exception as e:
+        log(f"learning rollups unavailable ({type(e).__name__}: {e})")
     state["schema"] = "valuatio-bot-training/v1"
     state["generatedAt"] = datetime.now(timezone.utc).isoformat()
     state["startingBankroll"] = STARTING_BANKROLL
@@ -3484,6 +3755,11 @@ def main():
     sig_before = {t.get("id"): _sig(t) for t in trades_list(state)}
     if app_done:
         log(f"applied {len(app_done)} app action(s)")
+    try:                                       # z192: learn from every closed trade (replayed - idempotent)
+        retrain(state, universe)
+        log_learning(state)
+    except Exception as e:
+        log(f"learning unavailable this pass ({type(e).__name__}: {e})")
 
     if not in_session:
         # z121: nothing trades outside the NYSE regular session - nights, weekends, holidays,
@@ -3660,6 +3936,12 @@ def main():
     open_before = {t.get("id") for t in trades_list(state) if t.get("status") == "open"}
     # z121: exits only at fresh quotes (a stale one is not managed this pass, never filled at an old price)
     closed = manage_open_positions(state, fresh, today, ctx)
+    if closed:
+        try:                                   # z192: this pass's closes teach before the entry scan
+            retrain(state, universe)
+            log_learning(state)
+        except Exception as e:
+            log(f"learning unavailable after the reviews ({type(e).__name__}: {e})")
     risk = None
     try:                                               # z186: the risk book - sizes, caps, throttle, halt
         risk = build_risk(state, universe, today, spy_returns(spy_data), not agnostic)
