@@ -1295,7 +1295,13 @@
    "dividends": [],
    "currency": null,
    "fetchedAt": "2026-11-18T12:35:11+00:00"
+  },
+  "STETH-USD": {
+   "splits": [],
+   "dividends": [],
+   "currency": null,
+   "fetchedAt": "2026-11-18T15:35:02+00:00"
   }
  },
- "asOf": "2026-11-18T12:35:11+00:00"
+ "asOf": "2026-11-18T15:35:02+00:00"
 }
