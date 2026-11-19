@@ -1297,7 +1297,57 @@
    "dividends": [],
    "currency": null,
    "fetchedAt": "2026-11-19T12:35:09+00:00"
+  },
+  "VALE": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-12",
+     "amount": 0.668
+    },
+    {
+     "exDate": "2026-08-13",
+     "amount": 0.4
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-11-19T15:35:02+00:00"
+  },
+  "COIN": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-11-19T15:35:02+00:00"
+  },
+  "MOS": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-04",
+     "amount": 0.22
+    },
+    {
+     "exDate": "2026-03-09",
+     "amount": 0.22
+    },
+    {
+     "exDate": "2026-05-21",
+     "amount": 0.22
+    },
+    {
+     "exDate": "2026-09-10",
+     "amount": 0.22
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-11-19T15:35:02+00:00"
+  },
+  "GC=F": {
+   "splits": [],
+   "dividends": [],
+   "currency": null,
+   "fetchedAt": "2026-11-19T15:35:02+00:00"
   }
  },
- "asOf": "2026-11-19T12:35:09+00:00"
+ "asOf": "2026-11-19T15:35:02+00:00"
 }
