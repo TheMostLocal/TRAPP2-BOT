@@ -101,6 +101,8 @@ HISTORY_BASE = {
 }
 FX_URL = f"{RAW}/TRAPP2-1/main/data/fx/rates.json"
 GRADES_URL = f"{RAW}/TRAPP2-ANALYTICS/main/data/research_grades.json"
+RATINGS_URL = (os.environ.get("RUNNER_RATINGS_URL") or
+               f"{RAW}/TRAPP2-CREDIT/main/data/ratings.json")    # z194: credit ratings (companies, funds, futures, FX)
 # Sector ETFs live in TRAPP2-1's history; used for sector-momentum + regime.
 ETF_HISTORY_BASE = f"{RAW}/TRAPP2-1/main/data/history"
 SPY_HISTORY_URL = f"{RAW}/TRAPP2-1/main/data/history/SPY.json"
@@ -211,14 +213,22 @@ CORE_EXIT_SCORE= _envf("RUNNER_CORE_EXIT_SCORE", 0.12)      # thesis-break: sign
 CORE_TRIM_TIERS= [0.25, 0.50, 1.00]                         # +25/50/100% → trim tiers (long only)
 CORE_TRIM_FRAC = _envf("RUNNER_CORE_TRIM_FRAC", 25) / 100.0 # trim this fraction of shares per tier
 
-LONG_TERM_SIGNALS = ("fundamentals", "researchGrade", "health", "peerGrade", "regimeGrade", "fed", "crossAsset")
+LONG_TERM_SIGNALS = ("fundamentals", "researchGrade", "health", "peerGrade", "regimeGrade", "fed", "crossAsset", "credit")
 SWING_SIGNALS     = ("trend", "momentum", "meanReversion", "optionsIV", "optionsMarket")
 # z192 (owner, 11-17: "the bot needs to learn from every trade"; leveraged / inverse ETPs stay tradable as long as
 # signals open and close them). A daily-reset product holds only while its signal does: re-scored in its direction
 # below this, past its minimum hold, it is closed ("signal-faded") - every session held costs the volatility drag.
 ETP_HOLD_SCORE = _envf("RUNNER_ETP_HOLD_SCORE", 0.10)
 COMPANY_SIGNALS = ("fundamentals", "health", "researchGrade", "peerGrade", "catalyst")   # a fund has none of these
-ETP_MARKET_SIGNALS = ("crossAsset", "optionsMarket")      # market-wide: an ETP carries them in its own direction
+ETP_MARKET_SIGNALS = ("crossAsset", "optionsMarket", "credit")   # market-wide: an ETP carries them in its own direction
+# z194: credit ratings (TRAPP2-CREDIT data/ratings.json, model-implied on the S&P scale). Every trade considers them:
+# a 'credit' signal in the blend (30 % rating level + 70 % credit trend: CDS, option-implied vol, migration; a fund's is
+# its holdings' trend, signed by its leverage), no new long at CCC+ or worse, sizes cut for weaker credits, a long closed
+# when its issuer falls into distress or is downgraded CREDIT_EXIT_NOTCHES+ (confirmed a session later).
+CREDIT_GATE_NOTCH = int(_envf("RUNNER_CREDIT_GATE_NOTCH", 17))      # CCC+ (17) or worse: no new longs
+CREDIT_EXIT_NOTCHES = int(_envf("RUNNER_CREDIT_EXIT_NOTCHES", 2))   # notches of downgrade since entry that close a long
+CREDIT_MAX_AGE_DAYS = _envf("RUNNER_CREDIT_MAX_AGE_DAYS", 4)        # older ratings: context only (no signal / gate / size / exit)
+CREDIT_IG = 10                                                      # BBB- : investment grade at or better
 ETP_SECTOR_SIGNALS = ("regimeGrade", "fed")                # sector / beta tilts: not defined for an ETP
 SIGNAL_BASIS = "z192"                                      # components recorded fund-clean and exposure-signed
 POSITION_PCT = _envf("RUNNER_POSITION_PCT", _MODE["pos_pct"]) / 100.0
@@ -1084,6 +1094,8 @@ BASE_WEIGHTS = {
     # among many - weighted like cross-asset, well below fundamentals or trend,
     # and further capped by FACTOR_CAP. It can fire a trigger; it can't decide alone.
     "pattern": 0.10,
+    # z194: credit - the issuer's rating level and credit trend (a fund's: its holdings'), weighted like peer grade
+    "credit": 0.12,
 }
 
 
@@ -1239,6 +1251,110 @@ _HC = {}                 # z151: {TICKER: {employees, yoyPct, fromPeakPct, date,
 _SEC = {}               # z158: {TICKER: {red30, caution30, insider, lastEvent}}
 _SHORT = {"volume": {}, "interest": {}}
 NO_LONG_ITEMS = {"1.03": "bankruptcy", "4.02": "non-reliance on past financials", "3.01": "delisting notice"}
+
+
+_RATINGS = {"loaded": False, "by": {}, "asOf": None, "stale": True, "summary": None}
+
+
+def load_ratings():
+    """z194: TRAPP2-CREDIT's ratings, read once a pass. Stale (older than CREDIT_MAX_AGE_DAYS) or missing: recorded on
+    trades as context, but no signal, gate, size or exit rests on them."""
+    if _RATINGS["loaded"]:
+        return _RATINGS
+    d = fetch_json(RATINGS_URL, timeout=45)
+    by = (d.get("ratings") or {}) if isinstance(d, dict) else {}
+    as_of = d.get("date") if isinstance(d, dict) else None
+    age = None
+    try:
+        age = ((NOW_UTC or datetime.now(timezone.utc)).date() - datetime.strptime(str(as_of)[:10], "%Y-%m-%d").date()).days
+    except (TypeError, ValueError):
+        pass
+    _RATINGS.update(loaded=True, by=by, asOf=as_of, stale=(age is None or age > CREDIT_MAX_AGE_DAYS),
+                    summary=(d.get("summary") if isinstance(d, dict) else None))
+    spy = by.get("SPY") or {}
+    log(f"credit ratings: {len(by)} instruments as of {as_of or '-'}" + (f" ({age} day(s) old)" if age is not None else "")
+        + (" - STALE: context only" if _RATINGS["stale"] else "")
+        + (f" · S&P 500 look-through {spy.get('r')} (WARF {((spy.get('lt') or {}).get('warf'))})" if spy.get("r") else ""))
+    return _RATINGS
+
+
+def credit_of(ticker):
+    """The rating record of an instrument, or None."""
+    return _RATINGS["by"].get(str(ticker or "").upper())
+
+
+def credit_card(cr):
+    """A compact rating snapshot for a trade record: letter, notch, outlook, signal, trend, source, as-of."""
+    if not cr:
+        return None
+    return {"r": cr.get("r"), "n": cr.get("n"), "o": cr.get("o") or "stable", "sig": cr.get("sig"), "tr": cr.get("tr"),
+            "src": cr.get("src"), "k": cr.get("k"), "asOf": _RATINGS.get("asOf"), "stale": bool(_RATINGS.get("stale"))}
+
+
+def credit_size_mult(cr, short=False, etp=None):
+    """z194: the size multiplier for a new position's credit. A long in a weaker credit is smaller - low-rated and
+    distressed stocks earn less and fall harder (Campbell, Hilscher & Szilagyi 2008; Avramov, Chordia, Jostova &
+    Philipov 2009); a short in the strongest credits is smaller (quality rarely collapses). Long an inverse product =
+    short its underlying. NR / stale / missing: 1.0."""
+    if not cr or _RATINGS["stale"] or not cr.get("n"):
+        return 1.0
+    n = int(cr["n"])
+    eff_short = bool(short) != bool(etp and (etp.get("lev") or 0) < 0)
+    if eff_short:
+        return 0.85 if n <= 4 else 1.0
+    return 1.0 if n <= CREDIT_IG else 0.85 if n <= 13 else 0.65 if n <= 16 else 0.5
+
+
+def credit_gate(ticker, direction, etp=None):
+    """z194: a hard guard on credit, like the 8-K one - no new long in a distressed credit (CCC+ or worse, or D). A long
+    in an inverse product is a short of its underlying and is not barred; shorts are not barred. -> reason or None."""
+    cr = None if _RATINGS["stale"] else credit_of(ticker)
+    if not cr or not cr.get("n") or int(cr["n"]) < CREDIT_GATE_NOTCH or direction == "short":
+        return None
+    if etp and (etp.get("lev") or 0) < 0:
+        return None
+    return f"rated {cr.get('r')} (CCC+ or worse) - no new longs in a distressed credit"
+
+
+def credit_exit(pos, today, review_only=False):
+    """z194: a long whose issuer falls into distress (CCC+ or worse) closes at once; a long downgraded
+    CREDIT_EXIT_NOTCHES+ since entry, or from investment grade to high yield, closes when the next session confirms it
+    (a one-day model swing never closes a position); a short is covered on the mirror-image upgrade. Companies held as
+    shares only (a fund's rating is its index's - its trend is in the signal). Positions opened before z194 are measured
+    from the first rating the bot saw (creditBaseline)."""
+    if pos.get("etp") or (pos.get("instrument") or "shares") != "shares":
+        return None
+    cr = credit_of(pos.get("ticker"))
+    if not cr or _RATINGS["stale"] or cr.get("k") != "co" or not cr.get("n"):
+        return None
+    n = int(cr["n"])
+    long_ = (pos.get("direction") or "long") != "short"
+    if long_ and n >= CREDIT_GATE_NOTCH:
+        return "credit-distress"
+    ent = pos.get("creditAtEntry") or pos.get("creditBaseline")
+    if not ent or not ent.get("n"):
+        if not review_only:
+            pos["creditBaseline"] = dict(credit_card(cr), date=today)
+        return None
+    n0 = int(ent["n"])
+    if long_:
+        broke = (n - n0 >= CREDIT_EXIT_NOTCHES) or (n0 <= CREDIT_IG < n)
+        why = f"downgraded {ent.get('r')} -> {cr.get('r')}"
+    else:
+        broke = (n0 - n >= CREDIT_EXIT_NOTCHES) or (n <= CREDIT_IG < n0)
+        why = f"upgraded {ent.get('r')} -> {cr.get('r')}"
+    w = pos.get("creditWatch")
+    if not broke:
+        if w and not review_only:
+            pos.pop("creditWatch", None)
+            log(f"  {pos.get('ticker')}: credit watch cleared ({cr.get('r')})")
+        return None
+    if w and str(w.get("date") or "") < today:
+        return "credit-downgrade" if long_ else "credit-upgrade"
+    if not w and not review_only:
+        pos["creditWatch"] = {"date": today, "r": cr.get("r"), "n": n, "why": why}
+        log(f"  {pos.get('ticker')}: credit watch - {why}; closes if the next session confirms it")
+    return None
 
 
 def load_filings_and_short():
@@ -2162,6 +2278,10 @@ def score_symbol(tk, u, ctx):
     cs = None if fund else tb.catalyst_signal(tb.catalyst_info(_CAL, tk, ctx.get("today") or datetime.now(timezone.utc).strftime("%Y-%m-%d")))
     if cs is not None and abs(cs) > 0.03:
         comps["catalyst"] = cs
+    # z194: credit - the issuer's rating level and trend; a fund's (unlevered) holdings' trend, signed below for an ETP
+    cr = None if _RATINGS["stale"] else credit_of(tk)
+    if cr and cr.get("sig") is not None and abs(cr["sig"]) > 0.02:
+        comps["credit"] = float(cr["sig"])
     if etp:
         _etp_sign_market(comps, etp, ctx.get("xa"))
     return {"comps": comps, "signed": blend_score(comps, ctx["weights"], ctx["weight_mods"]), "etp": etp}
@@ -2185,6 +2305,10 @@ def _etp_sign_market(comps, etp, xa):
     for k in ETP_SECTOR_SIGNALS + ("crossAsset",):
         comps.pop(k, None)
     sgn = 1.0 if etp["lev"] > 0 else -1.0
+    if comps.get("credit") is not None:
+        # z194: the rating file gives the UNLEVERED underlying's credit trend (a volatility product's is already "credit
+        # stress lifts it") - a bear fund gains when its index's credit deteriorates
+        comps["credit"] = round(sgn * comps["credit"], 3)
     if etp.get("underlying") != "equity":
         comps.pop("optionsMarket", None)
         return comps
@@ -2342,6 +2466,23 @@ def learning_rollups(state, universe=None):
                                      "winRateWhenLeaning": round(p["leanWon"] / p["lean"], 3) if p["lean"] else None,
                                      "currentWeight": round(float(w.get(k, 1.0)), 3)} for k, p in sig.items()),
                                    key=lambda x: -(x["winRateWhenLeaning"] or 0))
+    # z194: how trades did by the credit they were opened on (bucket at entry) - the rating's own track record
+    cb = {}
+    for t in trades_list(state):
+        if t.get("status") != "closed" or not (t.get("creditAtEntry") or {}).get("n"):
+            continue
+        n = int(t["creditAtEntry"]["n"])
+        b = "AAA-AA" if n <= 4 else "A" if n <= 7 else "BBB" if n <= 10 else "BB" if n <= 13 else "B" if n <= 16 else "CCC-D"
+        k = f"{b}|{'short' if t.get('direction') == 'short' else 'long'}"
+        pl = _trade_pl(t)
+        e = cb.setdefault(k, {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0})
+        e["trades"] += 1
+        e["wins"] += 1 if pl > 0 else 0
+        e["losses"] += 1 if pl < 0 else 0
+        e["pnl"] += pl
+    state["creditScores"] = [{"bucket": k.split("|")[0], "direction": k.split("|")[1], "trades": e["trades"],
+                              "winRate": round(e["wins"] / (e["wins"] + e["losses"]), 3) if (e["wins"] + e["losses"]) else None,
+                              "totalPnl": round(e["pnl"], 2)} for k, e in sorted(cb.items())]
     state["styleScores"] = sorted(({"style": k, "trades": s["trades"],
                                     "winRate": round(s["wins"] / (s["wins"] + s["losses"]), 3) if (s["wins"] + s["losses"]) else None,
                                     "totalPnl": round(s["pnl"], 2)} for k, s in sty.items()), key=lambda x: -x["totalPnl"])
@@ -2398,6 +2539,10 @@ def _review_context(state, universe, today):
     """z138 - the scoring context for the after-close review (the same signals the session uses,
     built without the entry-only pieces)."""
     grades = load_grades()
+    try:
+        load_ratings()                                  # z194
+    except Exception as e:
+        log(f"credit ratings unavailable ({type(e).__name__}: {e})")
     spy_data = fetch_json(SPY_HISTORY_URL, timeout=30)
     spy_closes = [c for c in ((_f(b.get("close")) or _f(b.get("price"))) for b in spy_data) if c and c > 0] if isinstance(spy_data, list) else None
     xa = compute_cross_asset()
@@ -2738,6 +2883,8 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
                 # z190: the rule (§1d 3) says a short sale needs a single stock - this one never qualified
                 exit_reason = "not-shortable"
                 log(f"  {pos.get('ticker')}: short sale in {_why} - unwound (RUNNER_UNWIND_UNSHORTABLE=0 keeps it)")
+        if not exit_reason and not is_alt:
+            exit_reason = credit_exit(pos, today, review_only)     # z194: distress / confirmed downgrade (short: upgrade)
         if exit_reason and review_only:
             review_lines.append(tb.review(pos, today, price=px, ret=ret, days_held=days_held, min_hold=min_hold, decision="flag",
                                           reason=f"{exit_reason} at ${px:,.2f} - acts at the next session's first pass", score_now=signed_now, cat=cat))
@@ -2755,6 +2902,8 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
             entry_cap = (shares or 0) * entry
             pos["returnPct"] = round((r / entry_cap) * 100, 2) if entry_cap else 0
             pos["sharesAtExit"] = round(shares or 0, 4)
+            pos["creditAtExit"] = credit_card(credit_of(pos.get("ticker")))    # z194
+            pos.pop("creditWatch", None)
             state["bankroll"] = round(state.get("bankroll", STARTING_BANKROLL) + r, 2)
             closed_now.append((pos["ticker"], exit_reason, total_r))
         # z138: the review - what it is, how it's doing, what's ahead, what the bot decided and why
@@ -2771,6 +2920,12 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
             decision, why = "hold", f"signal faded to {aligned_now:+.2f} - exits at the stop / target or the {pos.get('horizonDaysPlanned') or pos.get('horizonDays') or '—'}-session horizon"
         else:
             decision, why = "hold", ("thesis intact" + (f" (aligned {aligned_now:+.2f} in its direction)" if aligned_now is not None else ""))
+        crn = credit_of(pos.get("ticker"))
+        if crn and crn.get("r") and crn.get("r") != "NR":
+            ent = pos.get("creditAtEntry") or pos.get("creditBaseline") or {}
+            why += f" · credit {crn['r']}" + (f" (was {ent.get('r')})" if ent.get("r") and ent.get("r") != crn["r"] else "") \
+                + (f", {crn['o']}" if crn.get("o") and crn.get("o") != "stable" else "") \
+                + (" - on watch" if pos.get("creditWatch") else "")
         review_lines.append(tb.review(pos, today, price=px, ret=ret, days_held=days_held, min_hold=min_hold, decision=decision,
                                       reason=why, score_now=signed_now, cat=cat))
     for line in review_lines:
@@ -3095,6 +3250,10 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         if red and c.get("direction") != "short":
             log(f"  skip {c['ticker']}: 8-K {', '.join(f'{x} ({NO_LONG_ITEMS[x]})' for x in red)} in the last 30 days - no new longs")
             continue
+        blocked = credit_gate(c["ticker"], c.get("direction"), c.get("etp"))     # z194
+        if blocked:
+            log(f"  skip {c['ticker']}: {blocked}")
+            continue
         conf = c.get("confidence", 0.0)
         htype, lean = classify_horizon(c["components"], conf)
         if alt:
@@ -3198,6 +3357,10 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                     size *= alt["sizeMult"]
                 if explore and not alt:
                     size *= 0.7
+                cmult = credit_size_mult(credit_of(c["ticker"]), is_short, c.get("etp"))
+                if cmult != 1.0:
+                    size *= cmult                  # z194: weaker credit, smaller long
+                    size_why = f"{size_why} · credit {credit_of(c['ticker']).get('r')} x{cmult:.2f}"
                 risk_amt = size * eff_stop
                 ok_r, why_r = book.check(c["ticker"], c["sector"], c.get("direction"), size, -size if is_short else size,
                                          beta_v, rets, risk_amt)
@@ -3228,6 +3391,10 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                 if explore and not alt:
                     size *= 0.7                # z138: a first trade in an empty cell is a smaller, exploratory one
                 size_why = "notional"
+                cmult = credit_size_mult(credit_of(c["ticker"]), is_short, c.get("etp"))
+                if cmult != 1.0:
+                    size *= cmult                  # z194: weaker credit, smaller long
+                    size_why = f"notional · credit {credit_of(c['ticker']).get('r')} x{cmult:.2f}"
             room = hedge_room if use_hedge else deployable
             size = min(size, room)
             if size < bankroll * MIN_POSITION_PCT:
@@ -3322,6 +3489,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             "headcount": headcount_of(c["ticker"]),             # z151: context, not scored
             "filings": filings_of(c["ticker"]),                 # z158: 8-K flags, insiders, short selling - context
             "valuation": valuation_card(universe.get(c["ticker"]) or {}),   # z187: the multiples it was judged on
+            "creditAtEntry": credit_card(credit_of(c["ticker"])),   # z194: the rating it was opened on (exits measure from it)
         }
         if option and option.get("legs"):
             # z167: a vertical spread - two legs, one expiry; optionNet is the signed entry value per share
@@ -3893,6 +4061,10 @@ def main():
     except Exception as e:
         log(f"labor context failed: {e}")
     vol_ctx = None
+    try:
+        load_ratings()                                  # z194: credit ratings - signal, entry gate, size, exits
+    except Exception as e:
+        log(f"credit ratings unavailable ({type(e).__name__}: {e}) - trades run without them")
     try:
         load_filings_and_short()
         vol_ctx = volatility_context()
