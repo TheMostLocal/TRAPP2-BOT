@@ -103,6 +103,8 @@ FX_URL = f"{RAW}/TRAPP2-1/main/data/fx/rates.json"
 GRADES_URL = f"{RAW}/TRAPP2-ANALYTICS/main/data/research_grades.json"
 RATINGS_URL = (os.environ.get("RUNNER_RATINGS_URL") or
                f"{RAW}/TRAPP2-CREDIT/main/data/ratings.json")    # z194: credit ratings (companies, funds, futures, FX)
+WARNING_URL = (os.environ.get("RUNNER_WARNING_URL") or
+               f"{RAW}/TRAPP2-ANALYTICS/main/data/warning/signals.json")   # z196: the early-warning read ("the digging")
 # Sector ETFs live in TRAPP2-1's history; used for sector-momentum + regime.
 ETF_HISTORY_BASE = f"{RAW}/TRAPP2-1/main/data/history"
 SPY_HISTORY_URL = f"{RAW}/TRAPP2-1/main/data/history/SPY.json"
@@ -116,6 +118,8 @@ OPTIONS_BASE = f"{RAW}/TRAPP2-OPTIONS/main/data/options"          # z138: the op
 OPTIONS_BASE_LEGACY = f"{RAW}/TRAPP2/main/data/options"
 EARNINGS_CAL_URL = f"{RAW}/TRAPP2-ANALYTICS/main/data/earnings/calendar.json"   # z138: catalysts
 OPTIONS_MANIFEST_URL = f"{OPTIONS_BASE}/manifest.json"
+OPTIONS_MARKET_URL = f"{OPTIONS_BASE}/market.json"      # z196: the market read, precomputed over ~2,300 chains
+OPTIONS_SIGNALS_URL = f"{OPTIONS_BASE}/signals.json"    # z196: every name's options signal in one file
 # Index proxies whose ATM IV defines the market's expected move (VIX-like).
 MKT_OPT_INDEXES = ["SPY", "QQQ", "IWM"]
 
@@ -220,7 +224,7 @@ SWING_SIGNALS     = ("trend", "momentum", "meanReversion", "optionsIV", "options
 # below this, past its minimum hold, it is closed ("signal-faded") - every session held costs the volatility drag.
 ETP_HOLD_SCORE = _envf("RUNNER_ETP_HOLD_SCORE", 0.10)
 COMPANY_SIGNALS = ("fundamentals", "health", "researchGrade", "peerGrade", "catalyst")   # a fund has none of these
-ETP_MARKET_SIGNALS = ("crossAsset", "optionsMarket", "credit")   # market-wide: an ETP carries them in its own direction
+ETP_MARKET_SIGNALS = ("crossAsset", "optionsMarket", "credit", "warning")   # market-wide: an ETP carries them in its own direction
 # z194: credit ratings (TRAPP2-CREDIT data/ratings.json, model-implied on the S&P scale). Every trade considers them:
 # a 'credit' signal in the blend (30 % rating level + 70 % credit trend: CDS, option-implied vol, migration; a fund's is
 # its holdings' trend, signed by its leverage), no new long at CCC+ or worse, sizes cut for weaker credits, a long closed
@@ -937,11 +941,36 @@ def _atm(lst, spot):
         return None
     return sorted(lst, key=lambda c: abs((c.get("strike") or 0) - spot))[0]
 
+_OPT_SIGNALS = {"doc": None}
+OPT_SIGNAL_MAX_AGE_DAYS = 5
+
+
+def _opt_signal_row(ticker):
+    """z196: TRAPP2-OPTIONS signals.json - every name's extractOptionsSignal, computed by the pipeline from the same
+    chain (one file a pass instead of one chain per candidate; ~2,300 names since z196). None if absent or stale."""
+    if _OPT_SIGNALS["doc"] is None:
+        d = fetch_json(OPTIONS_SIGNALS_URL, timeout=30)
+        _OPT_SIGNALS["doc"] = (d.get("tickers") if isinstance(d, dict) else None) or {}
+    row = _OPT_SIGNALS["doc"].get(str(ticker).upper())
+    if not isinstance(row, list) or len(row) < 6 or row[0] is None:
+        return None
+    try:
+        age = ((NOW_UTC or datetime.now(timezone.utc)).date() - datetime.strptime(str(row[5])[:10], "%Y-%m-%d").date()).days
+    except (TypeError, ValueError):
+        return None
+    if age > OPT_SIGNAL_MAX_AGE_DAYS:
+        return None
+    return {"iv": row[0], "skew": row[1], "termSlope": row[2], "ivSignal": row[3], "source": "signals.json"}
+
+
 def extract_options_signal(ticker):
     """Per-name forward signal from the option chain, faithful to the app's
     extractOptionsSignal: ATM IV level + put/call skew + term structure → a small
     signed signal (rich IV / heavy downside skew / backwardation lean negative).
-    Returns dict or None."""
+    Returns dict or None. z196: the pipeline's signals.json first (same arithmetic, same chain), else the chain."""
+    pre = _opt_signal_row(ticker)
+    if pre:
+        return pre
     od = _load_option_chain(ticker)
     if not od or not isinstance(od.get("expiries"), list) or not od["expiries"]:
         return None
@@ -980,14 +1009,36 @@ def extract_options_signal(ticker):
             "termSlope": round(term_slope, 4) if term_slope is not None else None,
             "ivSignal": max(-1.0, min(1.0, round(iv_signal, 3)))}
 
+OPT_MARKET_MAX_AGE_DAYS = 3
+OPT_MARKET_SWEEP_CAP = 200      # z196: the legacy per-chain sweep (no market.json) reads at most this many chains
+
+
 def compute_options_market(universe_tickers):
     """Aggregate option chains across the manifest into a market-wide read:
     index-led IV → vol regime + a signed market-trend tilt. Faithful to the app's
-    computeOptionsMarketSignal. Loads each chain once. Returns dict or None."""
+    computeOptionsMarketSignal. Returns dict or None.
+    z196: TRAPP2-OPTIONS now precomputes this read (market.json, the same arithmetic over the index ETFs and the
+    full-ladder names) - the manifest lists ~2,300 chains, and sweeping them one HTTP request at a time would take
+    the whole pass. The sweep remains the fallback, capped (index ETFs first)."""
     if _OPT_MARKET["done"]:
         return _OPT_MARKET["data"]
+    mk = fetch_json(OPTIONS_MARKET_URL, timeout=30)
+    app = (mk or {}).get("appSignal") if isinstance(mk, dict) else None
+    if app and app.get("indexIV") is not None:
+        try:
+            age = ((NOW_UTC or datetime.now(timezone.utc)) - datetime.strptime(str(mk.get("asOf"))[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)).days
+        except (TypeError, ValueError):
+            age = 99
+        if age <= OPT_MARKET_MAX_AGE_DAYS:
+            data = {k: app.get(k) for k in ("count", "indexIV", "breadthIV", "avgSkew", "volRegime", "marketTrend")}
+            data["source"] = "market.json"
+            data["breadth"] = (mk.get("breadth") or None)
+            _OPT_MARKET.update(done=True, data=data)
+            return data
     man = fetch_json(OPTIONS_MANIFEST_URL, timeout=20)
     tickers = (man.get("tickers") if isinstance(man, dict) else None) or []
+    tickers = [t for t in MKT_OPT_INDEXES if t in tickers] + [t for t in tickers if t not in MKT_OPT_INDEXES]
+    tickers = [t for t in tickers if t != "run_report"][:OPT_MARKET_SWEEP_CAP]
     rows, idx_iv = [], []
     for tk in tickers:
         sig = extract_options_signal(tk)
@@ -1099,6 +1150,9 @@ BASE_WEIGHTS = {
     "pattern": 0.10,
     # z194: credit - the issuer's rating level and credit trend (a fund's: its holdings'), weighted like peer grade
     "credit": 0.12,
+    # z196: early warning - market-wide risk (published loss / lending / funding / labour data vs their history) and
+    # the name's sector exposure to the current warnings; the learning layer decides how much it is worth
+    "warning": 0.08,
 }
 
 
@@ -1332,6 +1386,133 @@ def seasoning_gate(ticker, repo):
         return None
     return (f"{n} session{'' if n == 1 else 's'} of price history (< {MIN_HISTORY_SESSIONS}) - a new listing is still in "
             f"price discovery (RUNNER_MIN_HISTORY_SESSIONS)")
+
+
+# ------------------------------------------------------------------------------------------- z196: early warning ---
+# TRAPP2-ANALYTICS data/warning/signals.json ("the digging", owner 11-19): published loss / lending / funding / labour
+# / collateral / leverage data scored against their own history, a composite RISK percentile, the regime (stress
+# building, market blindness, organic expansion ...), the industries each warning hits, and a backtest that says
+# whether acting on it has paid. In the bot:
+#   * a 'warning' signal in the blend - market risk and the name's industry exposure (+ organic growth only when the
+#     backtest earned it); a positive (risk-on) lean only when the risk read itself earned it
+#   * longs sized down as risk rises: x0.9 / 0.8 / 0.7 from the 60th / 75th / 90th percentile (never below x0.9 unless
+#     the backtest earned the throttle), x(1 - 0.35 e) in an exposed industry, a levered long x0.85 more at 75+
+#   * a short in an exposed industry up to x1.15 - only when earned
+#   * no new leveraged long fund at "extreme" risk in acute stress / stress spreading
+#   * warningAtEntry on every trade (context: the journal shows whether the warnings paid)
+# Stale (> WARNING_MAX_AGE_DAYS) or provisional (no FRED history yet): context only - no signal, size or gate.
+WARNING_MAX_AGE_DAYS = _envf("RUNNER_WARNING_MAX_AGE_DAYS", 4)
+_WARN = {"loaded": False, "doc": None, "stale": True, "age": None}
+
+
+def load_warning():
+    if _WARN["loaded"]:
+        return _WARN
+    d = fetch_json(WARNING_URL, timeout=45)
+    doc = d if isinstance(d, dict) and d.get("risk") is not None else None
+    age = None
+    try:
+        age = ((NOW_UTC or datetime.now(timezone.utc)).date() - datetime.strptime(str((doc or {}).get("date"))[:10], "%Y-%m-%d").date()).days
+    except (TypeError, ValueError):
+        pass
+    stale = doc is None or age is None or age > WARNING_MAX_AGE_DAYS or bool(doc.get("provisional"))
+    _WARN.update(loaded=True, doc=doc, stale=stale, age=age)
+    if doc:
+        log(f"early warning: {doc.get('headline')}" + (f" ({age} day(s) old)" if age is not None else "")
+            + (" - STALE / provisional: context only" if stale else ""))
+    else:
+        log("early warning: no read yet (TRAPP2-ANALYTICS data/warning/signals.json) - trades run without it")
+    return _WARN
+
+
+def _warn_live():
+    return None if _WARN["stale"] else _WARN["doc"]
+
+
+def _warn_earned(key):
+    return bool((((_warn_live() or {}).get("backtest") or {}).get("earned") or {}).get(key))
+
+
+def warning_exposure(sector, industry):
+    """How hard the current warnings hit this industry / sector: (e 0..1, why) - the stronger of the two matches."""
+    ex = (_warn_live() or {}).get("exposures") or {}
+    best = (0.0, None)
+    for kind, name in (("industry", industry), ("sector", sector)):
+        r = (ex.get(kind) or {}).get(name) if name else None
+        if r and float(r.get("e") or 0) > best[0]:
+            best = (float(r["e"]), f"{name}: {r.get('why')}")
+    return best
+
+
+def warning_signal(sector, industry, etp=None):
+    """The 'warning' component: -0.5 R - 0.6 e (+ 0.3 G in an earned organic expansion), R = (risk - 50) / 40 and
+    G = (growth percentile - 50) / 40 clipped to [-1, 1], e = the industry exposure (none for a fund - its market lean
+    is signed by its leverage in _etp_sign_market). Leans positive on low risk only when the risk read earned it."""
+    doc = _warn_live()
+    if not doc or doc.get("risk") is None:
+        return None
+    r = max(-1.0, min(1.0, (float(doc["risk"]) - 50) / 40))
+    e = 0.0 if etp else warning_exposure(sector, industry)[0]
+    sig = -0.5 * r - 0.6 * e
+    if doc.get("regime") == "organic expansion" and _warn_earned("organicUpside"):
+        gp = ((doc.get("gauges") or {}).get("growth") or {}).get("pct")
+        if gp is not None:
+            sig += 0.3 * max(0.0, min(1.0, (float(gp) - 50) / 40))
+    if not _warn_earned("throttle"):
+        sig = min(sig, 0.0)
+    return round(max(-1.0, min(1.0, sig)), 3)
+
+
+def warning_size_mult(sector, industry, short=False, etp=None):
+    """-> (multiplier, why). Risk-reducing by design: longs smaller as risk rises and in exposed industries; the only
+    increases (a short in an exposed industry, a long in an earned organic expansion) need the backtest's say-so."""
+    doc = _warn_live()
+    if not doc or doc.get("risk") is None:
+        return 1.0, None
+    risk = float(doc["risk"])
+    lev = float((etp or {}).get("lev") or 0)
+    eff_short = bool(short) != (lev < 0)
+    e, why = (0.0, None) if etp else warning_exposure(sector, industry)
+    if eff_short:
+        m = 1.0 + (0.15 * e if _warn_earned("throttle") else 0.0)
+        return round(min(1.15, m), 3), (why if m != 1.0 else None)
+    base = 1.0 if risk < 60 else 0.9 if risk < 75 else 0.8 if risk < 90 else 0.7
+    if not _warn_earned("throttle"):
+        base = max(base, 0.9)
+    if lev > 1 and risk >= 75:
+        base *= 0.85
+    m = base * (1 - 0.35 * e)
+    if doc.get("regime") == "organic expansion" and risk < 40 and _warn_earned("organicUpside") and not lev:
+        m = min(1.05, m * 1.05)
+    m = round(max(0.5, min(1.05, m)), 3)
+    if m == 1.0:
+        return 1.0, None
+    return m, " · ".join([f"risk {risk:.0f} ({doc.get('level')})"] + ([why] if e > 0 else []))
+
+
+def warning_gate(direction, etp=None):
+    """No new leveraged LONG fund (2x+) at extreme risk while markets are in acute stress / stress spreading - the
+    daily reset compounds against you in exactly those weeks. Inverse funds and shorts are not barred. -> reason or None."""
+    doc = _warn_live()
+    if not doc or direction == "short" or not etp or float(etp.get("lev") or 0) < 2:
+        return None
+    if doc.get("level") == "extreme" and doc.get("regime") in ("acute stress", "stress spreading"):
+        return f"early warning: {doc.get('level')} risk in {doc.get('regime')} - no new leveraged long fund ({float(etp['lev']):+g}x)"
+    return None
+
+
+def warning_card(sector=None, industry=None):
+    """The early-warning read on the trade date, for the journal."""
+    doc = _WARN.get("doc")
+    if not doc:
+        return None
+    g = doc.get("gauges") or {}
+    e, why = (0.0, None) if _WARN["stale"] else warning_exposure(sector, industry)
+    return {"risk": doc.get("risk"), "level": doc.get("level"), "regime": doc.get("regime"),
+            "fund": (g.get("fundamental") or {}).get("pct"), "mkt": (g.get("market") or {}).get("pct"),
+            "frag": (g.get("fragility") or {}).get("pct"), "growth": (g.get("growth") or {}).get("pct"),
+            "blind": any((f or {}).get("kind") == "blindness" for f in doc.get("flags") or []),
+            "exposure": round(e, 3), "why": why, "asOf": doc.get("date"), "stale": bool(_WARN["stale"])}
 
 
 def credit_exit(pos, today, review_only=False):
@@ -2300,6 +2481,10 @@ def score_symbol(tk, u, ctx):
     cr = None if _RATINGS["stale"] else credit_of(tk)
     if cr and cr.get("sig") is not None and abs(cr["sig"]) > 0.02:
         comps["credit"] = float(cr["sig"])
+    # z196: early warning - market risk + this industry's exposure to the current warnings (a fund: market lean only)
+    wsig = warning_signal(u.get("sector"), u.get("industry"), etp)
+    if wsig is not None and abs(wsig) > 0.03:
+        comps["warning"] = wsig
     if etp:
         _etp_sign_market(comps, etp, ctx.get("xa"))
     return {"comps": comps, "signed": blend_score(comps, ctx["weights"], ctx["weight_mods"]), "etp": etp}
@@ -2329,7 +2514,10 @@ def _etp_sign_market(comps, etp, xa):
         comps["credit"] = round(sgn * comps["credit"], 3)
     if etp.get("underlying") != "equity":
         comps.pop("optionsMarket", None)
+        comps.pop("warning", None)          # z196: an equity-market read says nothing about a rates / commodity / vol fund
         return comps
+    if comps.get("warning") is not None:
+        comps["warning"] = round(sgn * comps["warning"], 3)   # z196: a bear fund gains when the warning is right
     mkt = _market_cross_asset(xa)
     if mkt is not None:
         comps["crossAsset"] = round(sgn * mkt, 3)
@@ -2561,6 +2749,10 @@ def _review_context(state, universe, today):
         load_ratings()                                  # z194
     except Exception as e:
         log(f"credit ratings unavailable ({type(e).__name__}: {e})")
+    try:
+        load_warning()                                  # z196
+    except Exception as e:
+        log(f"early warning unavailable ({type(e).__name__}: {e})")
     spy_data = fetch_json(SPY_HISTORY_URL, timeout=30)
     spy_closes = [c for c in ((_f(b.get("close")) or _f(b.get("price"))) for b in spy_data) if c and c > 0] if isinstance(spy_data, list) else None
     xa = compute_cross_asset()
@@ -3269,7 +3461,8 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             log(f"  skip {c['ticker']}: 8-K {', '.join(f'{x} ({NO_LONG_ITEMS[x]})' for x in red)} in the last 30 days - no new longs")
             continue
         blocked = (credit_gate(c["ticker"], c.get("direction"), c.get("etp"))     # z194
-                   or seasoning_gate(c["ticker"], (universe.get(c["ticker"]) or {}).get("repo")))   # z195
+                   or seasoning_gate(c["ticker"], (universe.get(c["ticker"]) or {}).get("repo"))   # z195
+                   or warning_gate(c.get("direction"), c.get("etp")))                              # z196
         if blocked:
             log(f"  skip {c['ticker']}: {blocked}")
             continue
@@ -3380,6 +3573,11 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                 if cmult != 1.0:
                     size *= cmult                  # z194: weaker credit, smaller long
                     size_why = f"{size_why} · credit {credit_of(c['ticker']).get('r')} x{cmult:.2f}"
+                _u = universe.get(c["ticker"]) or {}
+                wmult, wwhy = warning_size_mult(_u.get("sector") or c.get("sector"), _u.get("industry"), is_short, c.get("etp"))
+                if wmult != 1.0:
+                    size *= wmult                  # z196: early warning - risk percentile and industry exposure
+                    size_why = f"{size_why} · warning x{wmult:.2f} ({wwhy})"
                 risk_amt = size * eff_stop
                 ok_r, why_r = book.check(c["ticker"], c["sector"], c.get("direction"), size, -size if is_short else size,
                                          beta_v, rets, risk_amt)
@@ -3414,6 +3612,11 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                 if cmult != 1.0:
                     size *= cmult                  # z194: weaker credit, smaller long
                     size_why = f"notional · credit {credit_of(c['ticker']).get('r')} x{cmult:.2f}"
+                _u = universe.get(c["ticker"]) or {}
+                wmult, wwhy = warning_size_mult(_u.get("sector") or c.get("sector"), _u.get("industry"), is_short, c.get("etp"))
+                if wmult != 1.0:
+                    size *= wmult                  # z196: early warning
+                    size_why = f"{size_why} · warning x{wmult:.2f} ({wwhy})"
             room = hedge_room if use_hedge else deployable
             size = min(size, room)
             if size < bankroll * MIN_POSITION_PCT:
@@ -3509,6 +3712,8 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             "filings": filings_of(c["ticker"]),                 # z158: 8-K flags, insiders, short selling - context
             "valuation": valuation_card(universe.get(c["ticker"]) or {}),   # z187: the multiples it was judged on
             "creditAtEntry": credit_card(credit_of(c["ticker"])),   # z194: the rating it was opened on (exits measure from it)
+            "warningAtEntry": warning_card((universe.get(c["ticker"]) or {}).get("sector") or c.get("sector"),
+                                           (universe.get(c["ticker"]) or {}).get("industry")),   # z196: the early-warning read
         }
         if option and option.get("legs"):
             # z167: a vertical spread - two legs, one expiry; optionNet is the signed entry value per share
@@ -4084,6 +4289,10 @@ def main():
         load_ratings()                                  # z194: credit ratings - signal, entry gate, size, exits
     except Exception as e:
         log(f"credit ratings unavailable ({type(e).__name__}: {e}) - trades run without them")
+    try:
+        load_warning()                                  # z196: early warning - signal, size, levered-long guard, context
+    except Exception as e:
+        log(f"early warning unavailable ({type(e).__name__}: {e}) - trades run without it")
     try:
         load_filings_and_short()
         vol_ctx = volatility_context()
