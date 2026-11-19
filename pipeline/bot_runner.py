@@ -229,6 +229,9 @@ CREDIT_GATE_NOTCH = int(_envf("RUNNER_CREDIT_GATE_NOTCH", 17))      # CCC+ (17) 
 CREDIT_EXIT_NOTCHES = int(_envf("RUNNER_CREDIT_EXIT_NOTCHES", 2))   # notches of downgrade since entry that close a long
 CREDIT_MAX_AGE_DAYS = _envf("RUNNER_CREDIT_MAX_AGE_DAYS", 4)        # older ratings: context only (no signal / gate / size / exit)
 CREDIT_IG = 10                                                      # BBB- : investment grade at or better
+# z195: a new listing (an IPO - Anthropic's ANT on 11-19 - or a spin-off) waits for this many sessions of price history
+# before the bot opens a position in it. 0 turns the wait off.
+MIN_HISTORY_SESSIONS = int(_envf("RUNNER_MIN_HISTORY_SESSIONS", 20))
 ETP_SECTOR_SIGNALS = ("regimeGrade", "fed")                # sector / beta tilts: not defined for an ETP
 SIGNAL_BASIS = "z192"                                      # components recorded fund-clean and exposure-signed
 POSITION_PCT = _envf("RUNNER_POSITION_PCT", _MODE["pos_pct"]) / 100.0
@@ -1314,6 +1317,21 @@ def credit_gate(ticker, direction, etp=None):
     if etp and (etp.get("lev") or 0) < 0:
         return None
     return f"rated {cr.get('r')} (CCC+ or worse) - no new longs in a distressed credit"
+
+
+def seasoning_gate(ticker, repo):
+    """z195: no new position until a listing has MIN_HISTORY_SESSIONS daily closes. With a handful of bars there is no
+    trend, momentum or RSI to read (they need 15-64), the stock's volatility is unknown and its first weeks are price
+    discovery - a position would rest on fundamentals and peers alone, at an IPO's widest swings. Exits are never
+    blocked. -> reason or None."""
+    if MIN_HISTORY_SESSIONS <= 0 or not repo:
+        return None
+    closes = load_history(ticker, repo)
+    n = len(closes) if closes else 0
+    if n >= MIN_HISTORY_SESSIONS:
+        return None
+    return (f"{n} session{'' if n == 1 else 's'} of price history (< {MIN_HISTORY_SESSIONS}) - a new listing is still in "
+            f"price discovery (RUNNER_MIN_HISTORY_SESSIONS)")
 
 
 def credit_exit(pos, today, review_only=False):
@@ -3250,7 +3268,8 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
         if red and c.get("direction") != "short":
             log(f"  skip {c['ticker']}: 8-K {', '.join(f'{x} ({NO_LONG_ITEMS[x]})' for x in red)} in the last 30 days - no new longs")
             continue
-        blocked = credit_gate(c["ticker"], c.get("direction"), c.get("etp"))     # z194
+        blocked = (credit_gate(c["ticker"], c.get("direction"), c.get("etp"))     # z194
+                   or seasoning_gate(c["ticker"], (universe.get(c["ticker"]) or {}).get("repo")))   # z195
         if blocked:
             log(f"  skip {c['ticker']}: {blocked}")
             continue
