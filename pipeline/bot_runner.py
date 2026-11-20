@@ -1515,6 +1515,130 @@ def warning_card(sector=None, industry=None):
             "exposure": round(e, 3), "why": why, "asOf": doc.get("date"), "stale": bool(_WARN["stale"])}
 
 
+# -------------------------------------------------------------------------------------------- z197: IPO calendar ---
+# TRAPP2-ANALYTICS data/web/ipo.json (the Business Web build from config/ipo_watch.json): lock-up releases and the
+# underwriters' research quiet period for recent IPOs (Anthropic 11-19-2026, SpaceX 06-12-2026). Owner 11-19: the banks
+# behind an IPO have already made their fees, and their analysts "pump their bags" with high targets - "it's something
+# that needs to be considered". In the bot:
+#   * no NEW long from IPO_LOCKUP_BEFORE sessions before a major lock-up release to IPO_LOCKUP_AFTER sessions after it -
+#     the supply overhang when insiders and early holders may sell (unlock days have carried negative abnormal returns
+#     in the academic studies, larger for venture-backed issuers). Shorts and exits are never blocked.
+#   * a long opened in the first IPO_QUIET_SESSIONS sessions after the research quiet period ends - when the syndicate's
+#     own analysts initiate (conflicted coverage) - is sized x IPO_QUIET_SIZE
+#   * ipoAtEntry on the trade (next event, sessions to it, lead underwriters, fees, conflicted window): the journal
+#     grades whether these rules paid - evidence, not assumption
+# Dated events only: a release defined by a rule ("after the Q3 results") or a price trigger is context, never a gate.
+IPO_URL = os.environ.get("RUNNER_IPO_URL") or f"{RAW}/TRAPP2-ANALYTICS/main/data/web/ipo.json"
+IPO_LOCKUP_BEFORE = int(_envf("RUNNER_IPO_LOCKUP_BEFORE", 3))
+IPO_LOCKUP_AFTER = int(_envf("RUNNER_IPO_LOCKUP_AFTER", 1))
+IPO_QUIET_SESSIONS = int(_envf("RUNNER_IPO_QUIET_SESSIONS", 5))
+IPO_QUIET_SIZE = _envf("RUNNER_IPO_QUIET_SIZE", 0.85)
+_IPO = {"loaded": False, "events": [], "ipos": {}, "asOf": None}
+
+
+def load_ipo():
+    if _IPO["loaded"]:
+        return _IPO
+    d = fetch_json(IPO_URL, timeout=30)
+    d = d if isinstance(d, dict) else {}
+    ev = [e for e in (d.get("events") or []) if isinstance(e, dict) and e.get("ticker")]
+    _IPO.update(loaded=True, events=ev, ipos=d.get("ipos") or {}, asOf=d.get("asOf"))
+    dated = [e for e in ev if e.get("date")]
+    if dated:
+        log("IPO calendar: " + " · ".join(f"{e['ticker']} {e['kind']} {e['date']}" + (" (major)" if e.get("major") else "")
+                                          for e in dated[:6]))
+    elif not d:
+        log("IPO calendar: none yet (TRAPP2-ANALYTICS data/web/ipo.json) - no lock-up guard")
+    return _IPO
+
+
+def _ipo_session_of(d, strictly_after=False):
+    """The session an event lands on: the date itself when it's a session, else the next one (a Sunday quiet-period
+    end -> Monday). strictly_after: the first session AFTER the date (research may publish the day after the quiet
+    period's last day)."""
+    if strictly_after:
+        d += timedelta(days=1)
+    for _ in range(10):
+        try:
+            if mh.day_status(d)[0]:
+                return d
+        except Exception:
+            if d.weekday() < 5:
+                return d
+        d += timedelta(days=1)
+    return d
+
+
+def _ipo_sessions(event_date, today, strictly_after=False):
+    """Sessions from the event's session to today: + after it, - before it (counting the event's session), 0 on it.
+    None when a date can't be read."""
+    a, b = tb._d(event_date), tb._d(today)
+    if not a or not b:
+        return None
+    a = _ipo_session_of(a, strictly_after)
+    if a == b:
+        return 0
+    if b > a:
+        return tb.sessions_between(a, b, mh.day_status)
+    return -tb.sessions_between(b, a, mh.day_status)
+
+
+def _ipo_events(ticker):
+    t = str(ticker or "").upper()
+    return [e for e in _IPO["events"] if str(e.get("ticker") or "").upper() == t and e.get("date")]
+
+
+def ipo_gate(ticker, direction, today):
+    """No new long into a major lock-up release (IPO_LOCKUP_BEFORE sessions before to IPO_LOCKUP_AFTER after).
+    -> reason or None."""
+    if direction == "short":
+        return None
+    for e in _ipo_events(ticker):
+        if e.get("kind") != "lock-up" or not e.get("major"):
+            continue
+        s = _ipo_sessions(e["date"], today)
+        if s is not None and -IPO_LOCKUP_BEFORE <= s <= IPO_LOCKUP_AFTER:
+            when = "today" if s == 0 else (f"in {-s} session{'s' if s < -1 else ''}" if s < 0 else f"{s} session{'s' if s > 1 else ''} ago")
+            sh = e.get("shares")
+            return (f"IPO lock-up release {e['date']} ({when}){f' - {sh / 1e6:,.0f}M shares' if sh else ''}: no new long into "
+                    f"the supply overhang")
+    return None
+
+
+def ipo_size_mult(ticker, short, today):
+    """A long in the sessions right after the underwriters' research quiet period ends (conflicted initiations) is
+    smaller. -> (multiplier, why)."""
+    if short:
+        return 1.0, None
+    for e in _ipo_events(ticker):
+        if e.get("kind") != "quiet-period":
+            continue
+        s = _ipo_sessions(e["date"], today, strictly_after=True)          # initiations: the session after it ends
+        if s is not None and 0 <= s < IPO_QUIET_SESSIONS:
+            return IPO_QUIET_SIZE, f"syndicate initiations window (quiet period ended {e['date']})"
+    return 1.0, None
+
+
+def ipo_card(ticker, today):
+    """The IPO context on the trade date, for the journal (None for anything that isn't a tracked IPO)."""
+    t = str(ticker or "").upper()
+    info = _IPO["ipos"].get(t)
+    if not info:
+        return None
+    nxt = None
+    for e in sorted(_ipo_events(t), key=lambda e: e["date"]):
+        s = _ipo_sessions(e["date"], today, strictly_after=e.get("kind") == "quiet-period")
+        if s is not None and s <= 0:
+            nxt = {"date": e["date"], "kind": e.get("kind"), "major": bool(e.get("major")), "sessionsTo": -s}
+            break
+    q = ipo_size_mult(t, False, today)
+    uw = info.get("underwriters") or {}
+    fees = info.get("fees") or {}
+    return {"firstTrade": info.get("firstTrade"), "ipoPrice": info.get("price"), "next": nxt,
+            "leadUnderwriters": uw.get("lead"), "syndicate": uw.get("count"), "fees": fees.get("owner") or fees.get("estimates"),
+            "conflictedWindow": q[0] != 1.0, "lockupGate": bool(ipo_gate(t, "long", today))}
+
+
 def credit_exit(pos, today, review_only=False):
     """z194: a long whose issuer falls into distress (CCC+ or worse) closes at once; a long downgraded
     CREDIT_EXIT_NOTCHES+ since entry, or from investment grade to high yield, closes when the next session confirms it
@@ -3462,7 +3586,8 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             continue
         blocked = (credit_gate(c["ticker"], c.get("direction"), c.get("etp"))     # z194
                    or seasoning_gate(c["ticker"], (universe.get(c["ticker"]) or {}).get("repo"))   # z195
-                   or warning_gate(c.get("direction"), c.get("etp")))                              # z196
+                   or warning_gate(c.get("direction"), c.get("etp"))                               # z196
+                   or ipo_gate(c["ticker"], c.get("direction"), today))                            # z197
         if blocked:
             log(f"  skip {c['ticker']}: {blocked}")
             continue
@@ -3578,6 +3703,10 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                 if wmult != 1.0:
                     size *= wmult                  # z196: early warning - risk percentile and industry exposure
                     size_why = f"{size_why} · warning x{wmult:.2f} ({wwhy})"
+                imult, iwhy = ipo_size_mult(c["ticker"], is_short, today)
+                if imult != 1.0:
+                    size *= imult                  # z197: conflicted-coverage window after an IPO's quiet period
+                    size_why = f"{size_why} · IPO x{imult:.2f} ({iwhy})"
                 risk_amt = size * eff_stop
                 ok_r, why_r = book.check(c["ticker"], c["sector"], c.get("direction"), size, -size if is_short else size,
                                          beta_v, rets, risk_amt)
@@ -3617,6 +3746,10 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                 if wmult != 1.0:
                     size *= wmult                  # z196: early warning
                     size_why = f"{size_why} · warning x{wmult:.2f} ({wwhy})"
+                imult, iwhy = ipo_size_mult(c["ticker"], is_short, today)
+                if imult != 1.0:
+                    size *= imult                  # z197: conflicted-coverage window after an IPO's quiet period
+                    size_why = f"{size_why} · IPO x{imult:.2f} ({iwhy})"
             room = hedge_room if use_hedge else deployable
             size = min(size, room)
             if size < bankroll * MIN_POSITION_PCT:
@@ -3714,6 +3847,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             "creditAtEntry": credit_card(credit_of(c["ticker"])),   # z194: the rating it was opened on (exits measure from it)
             "warningAtEntry": warning_card((universe.get(c["ticker"]) or {}).get("sector") or c.get("sector"),
                                            (universe.get(c["ticker"]) or {}).get("industry")),   # z196: the early-warning read
+            "ipoAtEntry": ipo_card(c["ticker"], today),         # z197: lock-up / quiet-period context (None if not an IPO)
         }
         if option and option.get("legs"):
             # z167: a vertical spread - two legs, one expiry; optionNet is the signed entry value per share
@@ -4293,6 +4427,10 @@ def main():
         load_warning()                                  # z196: early warning - signal, size, levered-long guard, context
     except Exception as e:
         log(f"early warning unavailable ({type(e).__name__}: {e}) - trades run without it")
+    try:
+        load_ipo()                                      # z197: IPO lock-up / quiet-period calendar - gate, size, context
+    except Exception as e:
+        log(f"IPO calendar unavailable ({type(e).__name__}: {e}) - trades run without it")
     try:
         load_filings_and_short()
         vol_ctx = volatility_context()
