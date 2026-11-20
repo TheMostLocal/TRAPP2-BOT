@@ -1463,6 +1463,25 @@ def warning_signal(sector, industry, etp=None):
     return round(max(-1.0, min(1.0, sig)), 3)
 
 
+# z198: the hypothesis lab's verdicts reach the bot. A hypothesis the lab SUPPORTS (12+ signal months, 2+ episodes
+# caught, lift >= 1.5, permutation p <= 0.10 over 1960-2026) whose signal is ON today and points down (a drawdown or a
+# recession ahead, or below-median returns) trims new longs once more - evidence earned, not assumed. Rejected and
+# inconclusive hypotheses move nothing; shorts are never enlarged by it.
+LAB_SIZE = _envf("RUNNER_LAB_SIZE", 0.9)
+
+
+def warning_lab_on():
+    """-> ids of supported, bearish hypotheses that are ON in the live read."""
+    out = []
+    for h in (((_warn_live() or {}).get("lab") or {}).get("nowOn") or []):
+        if (h or {}).get("status") != "supported":
+            continue
+        oc = str(h.get("outcome") or "")
+        if oc.startswith(("DD", "REC")) or (oc == "ABOVE_MED12" and h.get("expect") == "lower"):
+            out.append(str(h.get("id")))
+    return out
+
+
 def warning_size_mult(sector, industry, short=False, etp=None):
     """-> (multiplier, why). Risk-reducing by design: longs smaller as risk rises and in exposed industries; the only
     increases (a short in an exposed industry, a long in an earned organic expansion) need the backtest's say-so."""
@@ -1482,12 +1501,15 @@ def warning_size_mult(sector, industry, short=False, etp=None):
     if lev > 1 and risk >= 75:
         base *= 0.85
     m = base * (1 - 0.35 * e)
-    if doc.get("regime") == "organic expansion" and risk < 40 and _warn_earned("organicUpside") and not lev:
+    lab = warning_lab_on()
+    if lab:
+        m *= LAB_SIZE                                 # z198: a supported, bearish hypothesis is on
+    if doc.get("regime") == "organic expansion" and risk < 40 and _warn_earned("organicUpside") and not lev and not lab:
         m = min(1.05, m * 1.05)
     m = round(max(0.5, min(1.05, m)), 3)
     if m == 1.0:
         return 1.0, None
-    return m, " · ".join([f"risk {risk:.0f} ({doc.get('level')})"] + ([why] if e > 0 else []))
+    return m, " · ".join([f"risk {risk:.0f} ({doc.get('level')})"] + ([why] if e > 0 else []) + ([f"lab: {', '.join(lab)} on"] if lab else []))
 
 
 def warning_gate(direction, etp=None):
@@ -1512,7 +1534,8 @@ def warning_card(sector=None, industry=None):
             "fund": (g.get("fundamental") or {}).get("pct"), "mkt": (g.get("market") or {}).get("pct"),
             "frag": (g.get("fragility") or {}).get("pct"), "growth": (g.get("growth") or {}).get("pct"),
             "blind": any((f or {}).get("kind") == "blindness" for f in doc.get("flags") or []),
-            "exposure": round(e, 3), "why": why, "asOf": doc.get("date"), "stale": bool(_WARN["stale"])}
+            "exposure": round(e, 3), "why": why, "asOf": doc.get("date"), "stale": bool(_WARN["stale"]),
+            "labOn": [] if _WARN["stale"] else warning_lab_on()}           # z198: supported, bearish hypotheses on that day
 
 
 # -------------------------------------------------------------------------------------------- z197: IPO calendar ---
