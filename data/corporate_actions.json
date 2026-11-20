@@ -1351,7 +1351,32 @@
    "dividends": [],
    "currency": null,
    "fetchedAt": "2026-11-20T12:35:10+00:00"
+  },
+  "EWZ": {
+   "splits": [],
+   "dividends": [
+    {
+     "exDate": "2025-12-16",
+     "amount": 1.027
+    },
+    {
+     "exDate": "2025-12-30",
+     "amount": 0.106
+    },
+    {
+     "exDate": "2026-06-15",
+     "amount": 0.331
+    }
+   ],
+   "currency": "USD",
+   "fetchedAt": "2026-11-20T15:35:03+00:00"
+  },
+  "BNB-USD": {
+   "splits": [],
+   "dividends": [],
+   "currency": null,
+   "fetchedAt": "2026-11-20T15:35:03+00:00"
   }
  },
- "asOf": "2026-11-20T12:35:10+00:00"
+ "asOf": "2026-11-20T15:35:03+00:00"
 }
