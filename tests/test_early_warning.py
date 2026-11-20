@@ -4,6 +4,7 @@
 #  z196: the early-warning read in every trade - the 'warning' signal (a fund's in its own direction), risk / industry
 #  size multipliers (increases only when the backtest earned them), the leveraged-long guard, the journal card; and the
 #  options market read from TRAPP2-OPTIONS market.json / signals.json instead of a sweep of ~2,300 chains.
+#  z198: the hypothesis lab's supported, bearish hypotheses that are on trim new longs (x0.9) and ride on the card.
 #  Run: python -m unittest discover -s tests
 # ============================================================
 import os
@@ -140,6 +141,35 @@ class Signal(unittest.TestCase):
     def test_in_the_blend(self):
         self.assertIn("warning", br.BASE_WEIGHTS)
         self.assertIn("warning", br.ETP_MARKET_SIGNALS)
+
+
+class Lab(unittest.TestCase):
+    """z198: a SUPPORTED bearish hypothesis that is on trims new longs once (x0.9); nothing else from the lab moves size."""
+    def on(self, *hs):
+        d = doc(risk=45.0, level="moderate")
+        d["lab"] = {"nowOn": list(hs)}
+        set_warn(d)
+
+    def test_supported_bearish_on_trims_longs(self):
+        self.on({"id": "H15", "status": "supported", "outcome": "DD20_12"}, {"id": "H03", "status": "supported", "outcome": "REC24"})
+        m, why = br.warning_size_mult("Technology", "Software")
+        self.assertEqual(m, round(br.LAB_SIZE, 3))           # once, not once per hypothesis
+        self.assertIn("lab: H15, H03 on", why)
+        self.assertEqual(br.warning_size_mult("Technology", "Software", short=True), (1.0, None))   # shorts never enlarged by it
+
+    def test_only_supported_and_bearish(self):
+        self.on({"id": "H05", "status": "rejected", "outcome": "REC12"}, {"id": "H12", "status": "inconclusive", "outcome": "DD20_18"},
+                {"id": "H11", "status": "supported", "outcome": "ABOVE_MED12"})
+        self.assertEqual(br.warning_size_mult("Technology", "Software"), (1.0, None))
+        self.on({"id": "H06", "status": "supported", "outcome": "ABOVE_MED12", "expect": "lower"})
+        self.assertEqual(br.warning_lab_on(), ["H06"])
+
+    def test_stale_read_moves_nothing_and_card_records_it(self):
+        self.on({"id": "H15", "status": "supported", "outcome": "DD20_12"})
+        self.assertEqual(br.warning_card("Technology", "Software")["labOn"], ["H15"])
+        br._WARN["stale"] = True
+        self.assertEqual(br.warning_lab_on(), [])
+        self.assertEqual(br.warning_card("Technology", "Software")["labOn"], [])
 
 
 class Gate(unittest.TestCase):
