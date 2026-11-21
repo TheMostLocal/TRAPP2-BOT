@@ -62,6 +62,7 @@ import corporate_actions as ca  # noqa: E402  z166: splits and dividends
 CA_STATE = {"store": None, "fx": None}
 import trade_book as tb  # noqa: E402  z138: horizons (short / medium / long), options, catalysts, position reviews
 import risk_book as rb  # noqa: E402  z186: risk-budgeted sizes, sector / cluster / beta caps, drawdown throttle
+import market_tape as mt  # noqa: E402  z202: the market read as known at a session's open (the record of trends)
 
 # Repo owner — resolved at runtime so the pipeline follows the repos to any
 # GitHub account. Actions sets GITHUB_REPOSITORY_OWNER automatically;
@@ -451,6 +452,10 @@ def load_universe():
     n_fx = add_fx_instruments(rows, fx)                      # z164: currencies as USD-priced instruments
     if n_fx:
         log(f"  {n_fx} currencies tradable as FX:<CCY> (USD per unit, rates of {FX_ASOF.get('at')})")
+    try:                                                     # z202: market cap by the formula (before the medians use it)
+        apply_formula_mcap(rows)
+    except Exception as e:
+        log(f"  formula market caps unavailable ({type(e).__name__}: {e}) - Yahoo's kept")
     try:                                                     # z187: sector valuation medians for the relative step
         VAL_STATS.clear()
         VAL_STATS.update(valuation_stats(rows))
@@ -462,6 +467,45 @@ def load_universe():
     except Exception as e:
         log(f"  valuation medians unavailable ({type(e).__name__}: {e}) - absolute valuation rules")
     return rows
+
+
+# ------------------------------------------------------------------------- z202: market cap by the formula ---
+# TRAPP2-ANALYTICS data/sec/shares.json (pipeline/shares.py): per ticker the share count to trust - the SEC's own cover
+# count where Yahoo agrees (or the diluted count corroborates it), Yahoo's where they disagree. The bot's market cap
+# (size tiers, P/S and the valuation medians, the $2B short floor) = the USD price x that count. Checked at use: if
+# the count Yahoo's market cap implies NOW is > 10 % from the file's (a split or an issue since the file was built),
+# Yahoo's figure stays for that pass. The split check in the position reviews keeps reading YAHOO's market cap
+# (marketcapYahoo): it relies on Yahoo's count moving with a split.
+SHARES_URL = os.environ.get("RUNNER_SHARES_URL") or f"{RAW}/TRAPP2-ANALYTICS/main/data/sec/shares.json"
+SHARES_GUARD = 0.10
+
+
+def apply_formula_mcap(rows, doc=None):
+    """rows (load_universe) in place -> {"sec": n, "yahoo": n, "moved": n}."""
+    d = doc if doc is not None else fetch_json(SHARES_URL, timeout=30)
+    tk = d.get("tickers") if isinstance(d, dict) else None
+    out = {"sec": 0, "yahoo": 0, "moved": 0}
+    if not isinstance(tk, dict):
+        return out
+    for t, r in rows.items():
+        e = tk.get(t)
+        if not isinstance(e, dict) or str(r.get("currency") or "USD").strip().upper() not in ("USD", ""):
+            continue
+        sh, px, ym = _f(e.get("s")), _f(r.get("price")), _f(r.get("marketcap"))
+        if not sh or not px or px <= 0:
+            continue
+        if ym and abs(sh / (ym / px) - 1) > SHARES_GUARD:
+            out["moved"] += 1                                   # Yahoo's count moved since the file: keep Yahoo this pass
+            continue
+        r["marketcapYahoo"] = ym
+        r["marketcap"] = r["marketcapUSD"] = px * sh
+        r["mcapSource"] = f"{e.get('p')}:{e.get('st')}"
+        out["sec" if e.get("p") == "sec" else "yahoo"] += 1
+    if any(out.values()):
+        log(f"  market cap = price x shares: {out['sec']} on the SEC's own count, {out['yahoo']} on Yahoo's"
+            + (f", {out['moved']} kept Yahoo's (its count moved > {SHARES_GUARD:.0%} since the file - a split / issue?)" if out["moved"] else "")
+            + f" (TRAPP2-ANALYTICS data/sec/shares.json {d.get('date') or ''})")
+    return out
 
 
 def load_grades():
@@ -1676,12 +1720,32 @@ def ipo_card(ticker, today):
 #   * trendsAtEntry on every trade (the read, the S&P run incl. today's provisional close, gap / from-open,
 #     drawdown, VIX, breadth, EW vs CW) - the record that will say whether buying into sell-offs paid.
 # Stale (the doc's session > TREND_MAX_AGE_DAYS calendar days old) or missing: context only - no size change.
+#
+# z202 - CONSIDERED, NOT JUST RECORDED (owner 11-21: "make sure this new trends strategy is relevant and being
+# considered by the BOT and QUANT ... improve these trading schemas without faster data for now"):
+#   * THE RECORD DECIDES THE TRIM. trend_evidence() labels every closed equity long by the market read as known at its
+#     entry day's open (pipeline/market_tape.py - six of the seven criteria, from daily closes, so the whole journal
+#     is labelled, not only trades since z201) and compares longs opened in a sell-off with the rest: per entry-day
+#     means (trades on one day share one market - as the quant lab clusters by session), Welch t, >= TREND_MIN_DAYS
+#     days and TREND_MIN_TRADES trades a side. "worse" (t <= -2) deepens the trim to TREND_SIZE_EARNED (0.8);
+#     "better" (t >= 2) lifts it (1.0); until then the 0.9 is a stated prior. Never an increase.
+#   * NET LONG BETA in a sell-off: the risk book's net beta cap for the long side x TREND_BETA (0.75: +-45 % -> +34 %
+#     long) while the read is a sell-off / heavy sell-off or the S&P 500 is in a correction / bear market - new longs
+#     can't push the book's market exposure up into a falling tape; shorts and hedges (which shrink it) pass as before.
+#   * trendScores (learning rollups): how trades did by the market they were opened in (calm / pressure / selloff x
+#     long / short) - the read's own track record, beside creditScores.
 TRENDS_URL = os.environ.get("RUNNER_TRENDS_URL") or f"{RAW}/TRAPP2-ANALYTICS/main/data/trends/latest.json"
 TREND_SIZE = _envf("RUNNER_TREND_SIZE", 0.9)
+TREND_SIZE_EARNED = _envf("RUNNER_TREND_SIZE_EARNED", 0.8)       # z202: when the record says sell-off longs did worse
+TREND_BETA = _envf("RUNNER_TREND_BETA", 0.75)                   # z202: the long side's net beta cap in a sell-off
+TREND_MIN_DAYS = int(_envf("RUNNER_TREND_MIN_DAYS", 8))         # z202: entry days a side before the record decides
+TREND_MIN_TRADES = int(_envf("RUNNER_TREND_MIN_TRADES", 20))    # z202: ... and trades a side
+TREND_T = _envf("RUNNER_TREND_T", 2.0)                          # z202: |Welch t| the difference must clear
 TREND_MAX_AGE_DAYS = _envf("RUNNER_TREND_MAX_AGE_DAYS", 4)
 TREND_STATES = ("sell-off", "heavy sell-off")
 TREND_OVERLAYS = ("correction", "bear market")
-_TREND = {"loaded": False, "doc": None, "stale": True, "age": None}
+_TREND = {"loaded": False, "doc": None, "stale": True, "age": None, "evidence": None}
+_TAPE = {"loaded": False, "H": None, "memo": {}}
 
 
 def load_trends():
@@ -1719,8 +1783,122 @@ def trend_size_mult(short=False, etp=None, alt=None):
         return 1.0, None
     r = doc.get("read") or {}
     if r.get("state") in TREND_STATES or r.get("overlay") in TREND_OVERLAYS:
-        return round(max(0.5, TREND_SIZE), 3), f"S&P 500 {r.get('label')}, {r.get('on')} of {r.get('of')}"
+        ev = (_TREND.get("evidence") or {}).get("verdict")       # z202: the bot's own record decides
+        m = TREND_SIZE_EARNED if ev == "worse" else 1.0 if ev == "better" else TREND_SIZE
+        if m >= 1.0:
+            return 1.0, None
+        tail = "the record: sell-off longs did worse" if ev == "worse" else f"a prior - the record: {ev or 'not yet'}"
+        return round(max(0.5, m), 3), f"S&P 500 {r.get('label')}, {r.get('on')} of {r.get('of')} · {tail}"
     return 1.0, None
+
+
+def trend_beta_scale():
+    """z202: -> (scale on the long side's net beta cap, why). x TREND_BETA while the market reads sell-off / heavy
+    sell-off or the S&P 500 is in a correction / bear market; 1.0 otherwise, stale or missing."""
+    doc = None if _TREND["stale"] else _TREND["doc"]
+    if not doc or TREND_BETA >= 1.0:
+        return 1.0, None
+    r = doc.get("read") or {}
+    if r.get("state") in TREND_STATES or r.get("overlay") in TREND_OVERLAYS:
+        return round(max(0.25, TREND_BETA), 3), f"S&P 500 {r.get('label')}"
+    return 1.0, None
+
+
+def load_tape():
+    """z202: TRAPP2-1's daily ^GSPC / ^VIX / HYG / SPY (pipeline/market_tape.py), once per pass."""
+    if not _TAPE["loaded"]:
+        _TAPE["loaded"] = True
+        try:
+            _TAPE["H"] = mt.load_histories(lambda url: fetch_json(url, timeout=30))
+        except Exception as e:
+            log(f"market tape unavailable ({type(e).__name__}: {e})")
+            _TAPE["H"] = None
+    return _TAPE["H"]
+
+
+def read_at_open(day):
+    """z202: the market read as known at the open of `day` (calm / pressure / selloff + the numbers) or None."""
+    if not day:
+        return None
+    d = str(day)[:10]
+    if d not in _TAPE["memo"]:
+        H = load_tape()
+        _TAPE["memo"][d] = mt.state_on(d, H) if H and (H.get("spx") or ([],))[0] else None
+    return _TAPE["memo"][d]
+
+
+def _equity_long(t):
+    """z202: a closed SHARES trade that is in effect long equities (an inverse fund is a short; crypto, futures, FX,
+    indices and rates / commodity / volatility funds are not equity reads)."""
+    if t.get("instrument") not in (None, "shares"):
+        return False
+    tk = str(t.get("ticker") or "").upper()
+    if tk.endswith("-USD") or tk.endswith("-USDT") or tk.endswith("=F") or tk.endswith("=X") or tk.startswith("^") or "." in tk:
+        return False                                     # crypto, futures, FX, indices, foreign listings (their own market)
+    etp = t.get("etp") or None
+    if etp and etp.get("underlying") not in (None, "equity"):
+        return False
+    lev = float((etp or {}).get("lev") or 0)
+    return (t.get("direction") != "short") != (lev < 0)
+
+
+TREND_RET_CAP = 50.0                    # z202: a trade's return counted at most +-50 % (the June app-era journal has FX-basis
+                                        # outliers, e.g. a +403 % 000660.KS long) - one bad record can't decide the verdict
+
+
+def _ret_pct(t, cap=None):
+    n = float(t.get("notional") or t.get("dollars") or 0)
+    if n <= 0:
+        return None
+    r = _trade_pl(t) / n * 100
+    return max(-cap, min(cap, r)) if cap else r
+
+
+def trend_evidence(state):
+    """z202: did equity longs opened in a sell-off (the read at the entry day's open) do better or worse than the rest?
+    Per entry-day mean returns (trades on one day share one market), Welch t between the two groups of days.
+    -> {verdict: not yet | worse | better | no difference, why, selloff {...}, other {...}, t, rule}"""
+    days = {"selloff": {}, "other": {}}
+    trades = {"selloff": 0, "other": 0}
+    for t in trades_list(state):
+        if t.get("status") != "closed" or not _equity_long(t):
+            continue
+        r = _ret_pct(t, TREND_RET_CAP)
+        st = (read_at_open(t.get("entryDate") or str(t.get("entryAt") or "")[:10]) or {}).get("state")
+        if r is None or not st:
+            continue
+        g = "selloff" if st == "selloff" else "other"
+        days[g].setdefault(str(t.get("entryDate") or t.get("entryAt"))[:10], []).append(r)
+        trades[g] += 1
+
+    def side(g):
+        xs = [sum(v) / len(v) for v in days[g].values()]
+        n = len(xs)
+        m = sum(xs) / n if n else None
+        sd = math.sqrt(sum((x - m) ** 2 for x in xs) / (n - 1)) if n > 1 else None
+        return {"days": n, "trades": trades[g], "meanPct": round(m, 3) if m is not None else None,
+                "sdPct": round(sd, 3) if sd is not None else None}, m, sd, n
+    a, ma, sa, na = side("selloff")
+    b, mb, sb, nb = side("other")
+    t_val = None
+    if sa is not None and sb is not None:
+        se = math.sqrt(sa * sa / na + sb * sb / nb)
+        if se > 0:
+            t_val = round((ma - mb) / se, 2)
+    out = {"selloff": a, "other": b, "t": t_val,
+           "rule": (f"US equity longs (shares; inverse funds count as shorts; crypto, futures, foreign listings and non-equity funds out) "
+                    f"by the market read at the entry day's open (pipeline/market_tape.py: selloff vs calm + pressure); returns capped at "
+                    f"+-{TREND_RET_CAP:g} %; per entry-day means, Welch t; needs >= {TREND_MIN_DAYS} days and >= {TREND_MIN_TRADES} trades a side and |t| >= {TREND_T:g}")}
+    enough = na >= TREND_MIN_DAYS and nb >= TREND_MIN_DAYS and trades["selloff"] >= TREND_MIN_TRADES and trades["other"] >= TREND_MIN_TRADES
+    if not enough:
+        out["verdict"] = "not yet"
+        out["why"] = (f"sell-off longs on {na} of {TREND_MIN_DAYS} days needed ({trades['selloff']} of {TREND_MIN_TRADES} trades)"
+                      f" · the rest on {nb} days ({trades['other']} trades)")
+    else:
+        diff = f"longs opened in sell-offs averaged {ma:+.2f}% a trade-day vs {mb:+.2f}% (t {t_val})"
+        out["verdict"] = "worse" if (t_val is not None and t_val <= -TREND_T) else "better" if (t_val is not None and t_val >= TREND_T) else "no difference"
+        out["why"] = diff
+    return out
 
 
 def trend_card():
@@ -1743,7 +1921,9 @@ def trend_card():
             "run": run, "runThrough": s.get("through"), "runNow": run_now,
             "dd52": (spx.get("high52") or {}).get("dd"), "vix": ((doc.get("vol") or {}).get("^VIX") or {}).get("close"),
             "pctUp": ins.get("pctUp"), "ew": ins.get("ew"), "cw": ins.get("cw"),
-            "date": doc.get("date"), "etTime": doc.get("etTime"), "session": doc.get("state"), "stale": bool(_TREND["stale"])}
+            "date": doc.get("date"), "etTime": doc.get("etTime"), "session": doc.get("state"), "stale": bool(_TREND["stale"]),
+            "atOpen": (lambda m: {k: m.get(k) for k in ("state", "on", "of", "asOf", "run", "dd")} if m else None)(
+                read_at_open(datetime.now(timezone.utc).strftime("%Y-%m-%d") if NOW_UTC is None else NOW_UTC.strftime("%Y-%m-%d")))}
 
 
 def credit_exit(pos, today, review_only=False):
@@ -2917,6 +3097,29 @@ def learning_rollups(state, universe=None):
         e["wins"] += 1 if pl > 0 else 0
         e["losses"] += 1 if pl < 0 else 0
         e["pnl"] += pl
+    # z202: how trades did by the market they were opened in (the read at the entry day's open) - the tape's own record
+    tsc = {}
+    for t in trades_list(state):
+        if t.get("status") != "closed":
+            continue
+        st = (read_at_open(t.get("entryDate") or str(t.get("entryAt") or "")[:10]) or {}).get("state")
+        if not st:
+            continue
+        k = f"{st}|{'short' if t.get('direction') == 'short' else 'long'}"
+        pl, rp = _trade_pl(t), _ret_pct(t, TREND_RET_CAP)
+        e = tsc.setdefault(k, {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "ret": []})
+        e["trades"] += 1
+        e["wins"] += 1 if pl > 0 else 0
+        e["losses"] += 1 if pl < 0 else 0
+        e["pnl"] += pl
+        if rp is not None:
+            e["ret"].append(rp)
+    order = {"calm": 0, "pressure": 1, "selloff": 2}
+    state["trendScores"] = [{"read": k.split("|")[0], "direction": k.split("|")[1], "trades": e["trades"],
+                             "winRate": round(e["wins"] / (e["wins"] + e["losses"]), 3) if (e["wins"] + e["losses"]) else None,
+                             "totalPnl": round(e["pnl"], 2), "avgReturnPct": round(sum(e["ret"]) / len(e["ret"]), 3) if e["ret"] else None}
+                            for k, e in sorted(tsc.items(), key=lambda kv: (order.get(kv[0].split("|")[0], 9), kv[0]))]
+    state["trendEvidence"] = trend_evidence(state)
     state["creditScores"] = [{"bucket": k.split("|")[0], "direction": k.split("|")[1], "trades": e["trades"],
                               "winRate": round(e["wins"] / (e["wins"] + e["losses"]), 3) if (e["wins"] + e["losses"]) else None,
                               "totalPnl": round(e["pnl"], 2)} for k, e in sorted(cb.items())]
@@ -3070,7 +3273,7 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
         # freeze the position (no stop / target / trim on a price that can't be trusted) and say so every pass.
         prev = _f(pos.get("lastPrice"))
         if prev and px and (pos.get("instrument") or "shares") == "shares" and ca.split_like(px / prev):
-            mc_now, mc_prev = _f(u.get("marketcap")), _f(pos.get("lastMarketCap"))
+            mc_now, mc_prev = _f(u.get("marketcapYahoo") or u.get("marketcap")), _f(pos.get("lastMarketCap"))   # z202: Yahoo's (moves with a split)
             real_move = bool(mc_now and mc_prev and not (0.6 <= mc_now / mc_prev <= 1.6))
             if not real_move:
                 confirmed = []
@@ -3092,7 +3295,7 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
                     review_lines.append(msg)
                     continue
         pos.pop("priceAnomaly", None)
-        pos["lastMarketCap"] = _f(u.get("marketcap"))
+        pos["lastMarketCap"] = _f(u.get("marketcapYahoo") or u.get("marketcap"))
         pos["lastPrice"] = px
         pos["lastPriceLocal"] = u.get("priceLocal")
         direction = -1 if pos.get("direction") == "short" else 1
@@ -4238,6 +4441,7 @@ def build_risk(state, universe, today, spy_rets, dialed):
     chg = rb.day_change(state.get("equityCurve"), value_now, today)
     halted = chg is not None and chg <= -rb.DAY_HALT
     book = rb.Book(bankroll, dialed, dd["scale"], halted, today)
+    book.long_beta_scale, book.long_beta_why = trend_beta_scale()   # z202: a sell-off tightens the long side's net beta cap
     for p in open_pos:
         tk = str(p.get("ticker") or "").upper()
         u = universe.get(tk) or {}
@@ -4268,7 +4472,9 @@ def log_risk(risk):
     log(f"risk: book ${dd['value']:,.0f} · high-water ${dd['hwm']:,.0f} ({dd['hwmDate']}) · drawdown {dd['dd']:.1%} → new risk x{dd['scale']:.2f}"
         f" · today {('%+.2f%%' % (risk['dayChange'] * 100)) if risk['dayChange'] is not None else 'n/a'}{' · HALT' if b.halted else ''}")
     log(f"risk: shares {sm['gross']:.0%} of the book (cap {rb.GROSS_CAP:.0%}) · options at risk {sm['optionRisk']:.1%} (cap {tb.OPT_BOOK_PCT:.0%}) · "
-        f"net {sm['net']:+.0%} · net beta {sm['netBeta']:+.0%} (cap ±{rb.NET_BETA_CAP[b.dialed]:.0%}) · top sectors {top or 'none'}"
+        f"net {sm['net']:+.0%} · net beta {sm['netBeta']:+.0%} (cap ±{rb.NET_BETA_CAP[b.dialed]:.0%}"
+        + (f", long side +{rb.NET_BETA_CAP[b.dialed] * b.long_beta_scale:.0%} - {b.long_beta_why}" if getattr(b, "long_beta_scale", 1.0) < 1.0 else "")
+        + f") · top sectors {top or 'none'}"
         + (f" · beyond the ±{rb.SECTOR_CAP:.0%} sector cap: {', '.join(sm['overSectorCap'])} (only trades that shrink them)" if sm["overSectorCap"] else "")
         + f" · shorts {'on' if ALLOW_SHORTS else 'OFF'}")
 
@@ -4551,6 +4757,14 @@ def main():
         load_trends()                                   # z201: today's trends - the market read: size, context
     except Exception as e:
         log(f"today's trends unavailable ({type(e).__name__}: {e}) - trades run without them")
+    try:                                                # z202: the record decides the trim (and is logged every pass)
+        _TREND["evidence"] = trend_evidence(state)
+        ev = _TREND["evidence"]
+        m_open = read_at_open(today)
+        log(f"today's trends - the record: {ev['verdict']} ({ev['why']})"
+            + (f" · the read at today's open: {m_open['state']} ({m_open['on']} of {m_open['of']}, through {m_open['asOf']})" if m_open else ""))
+    except Exception as e:
+        log(f"trend record unavailable ({type(e).__name__}: {e})")
     try:
         load_filings_and_short()
         vol_ctx = volatility_context()
