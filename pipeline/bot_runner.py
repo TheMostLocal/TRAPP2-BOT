@@ -1662,6 +1662,90 @@ def ipo_card(ticker, today):
             "conflictedWindow": q[0] != 1.0, "lockupGate": bool(ipo_gate(t, "long", today))}
 
 
+# ------------------------------------------------------------------------------------------ z201: today's trends ---
+# TRAPP2-ANALYTICS data/trends/latest.json (pipeline/trends.py, every 30 min on weekdays 0915-1845 ET): the S&P 500's
+# close-to-close run and how rare it is (today's provisional close counted in the session), its drawdown from the
+# 52-week high, the 50-day average, VIX, distribution days, breadth (members up, equal- vs cap-weighted) and credit
+# (HYG) scored into one market read - calm / under pressure / sell-off / heavy sell-off, with correction (-10%) and
+# bear market (-20%) overlays. Owner 11-20: "this can be used for the bot as an indicator, it doesn't necessarily need
+# to be displayed individually to a stock but just considered." In the bot:
+#   * new equity LONGS (stocks, long equity funds) sized x TREND_SIZE (0.9) while the read is a sell-off / heavy
+#     sell-off or the S&P 500 is in a correction / bear market - one trim, not one per criterion. A prior, not an
+#     earned edge: the journal decides (below). Shorts, inverse funds, rates / commodity / volatility funds, crypto
+#     and futures are untouched - never enlarged by it.
+#   * trendsAtEntry on every trade (the read, the S&P run incl. today's provisional close, gap / from-open,
+#     drawdown, VIX, breadth, EW vs CW) - the record that will say whether buying into sell-offs paid.
+# Stale (the doc's session > TREND_MAX_AGE_DAYS calendar days old) or missing: context only - no size change.
+TRENDS_URL = os.environ.get("RUNNER_TRENDS_URL") or f"{RAW}/TRAPP2-ANALYTICS/main/data/trends/latest.json"
+TREND_SIZE = _envf("RUNNER_TREND_SIZE", 0.9)
+TREND_MAX_AGE_DAYS = _envf("RUNNER_TREND_MAX_AGE_DAYS", 4)
+TREND_STATES = ("sell-off", "heavy sell-off")
+TREND_OVERLAYS = ("correction", "bear market")
+_TREND = {"loaded": False, "doc": None, "stale": True, "age": None}
+
+
+def load_trends():
+    if _TREND["loaded"]:
+        return _TREND
+    d = fetch_json(TRENDS_URL, timeout=30)
+    doc = d if isinstance(d, dict) and isinstance(d.get("read"), dict) and isinstance(d.get("indices"), dict) else None
+    age = None
+    try:
+        age = ((NOW_UTC or datetime.now(timezone.utc)).date() - datetime.strptime(str((doc or {}).get("date"))[:10], "%Y-%m-%d").date()).days
+    except (TypeError, ValueError):
+        pass
+    stale = doc is None or age is None or age < 0 or age > TREND_MAX_AGE_DAYS
+    _TREND.update(loaded=True, doc=doc, stale=stale, age=age)
+    if doc:
+        c = trend_card() or {}
+        m, why = trend_size_mult()
+        log(f"today's trends: {c.get('label')} ({c.get('on')} of {c.get('of')}) · S&P 500 {c.get('spxChg')}% "
+            f"({'final' if c.get('spxFinal') else 'provisional ' + str(c.get('etTime') or '')}) · run {c.get('run')} through "
+            f"{c.get('runThrough')}" + (f" ({age} day(s) old)" if age else "")
+            + (" - STALE: context only" if stale else f" · new equity longs x{m:.2f}" if m != 1.0 else " · no size change"))
+    else:
+        log("today's trends: no read yet (TRAPP2-ANALYTICS data/trends/latest.json) - trades run without it")
+    return _TREND
+
+
+def trend_size_mult(short=False, etp=None, alt=None):
+    """-> (multiplier, why). One trim on a new equity long while the market reads sell-off / heavy sell-off or the
+    S&P 500 is in a correction / bear market. Never enlarges anything; a short or an inverse fund is untouched."""
+    doc = None if _TREND["stale"] else _TREND["doc"]
+    if not doc or TREND_SIZE >= 1.0:
+        return 1.0, None
+    lev = float((etp or {}).get("lev") or 0)
+    if alt or (etp and etp.get("underlying") != "equity") or (bool(short) != (lev < 0)):
+        return 1.0, None
+    r = doc.get("read") or {}
+    if r.get("state") in TREND_STATES or r.get("overlay") in TREND_OVERLAYS:
+        return round(max(0.5, TREND_SIZE), 3), f"S&P 500 {r.get('label')}, {r.get('on')} of {r.get('of')}"
+    return 1.0, None
+
+
+def trend_card():
+    """Today's market read on the trade date, for the journal (None before the first trends run)."""
+    doc = _TREND.get("doc")
+    if not doc:
+        return None
+    r = doc.get("read") or {}
+    spx = (doc.get("indices") or {}).get("^GSPC") or {}
+    s = spx.get("streak") or {}
+    pv = (spx.get("provisional") or {}).get("now")
+    ins = doc.get("internals") or {}
+    run = (-1 if s.get("dir") == "down" else 1) * int(s.get("n") or 0) if s.get("dir") else 0
+    run_now = run                                     # the run if today closed where it is now
+    if pv in ("red", "green"):
+        same = (pv == "red") == (run < 0) and run != 0
+        run_now = (run + (-1 if run < 0 else 1)) if same else (-1 if pv == "red" else 1)
+    return {"state": r.get("state"), "overlay": r.get("overlay"), "label": r.get("label"), "on": r.get("on"), "of": r.get("of"),
+            "spxChg": spx.get("chg"), "spxFinal": bool(spx.get("final")), "gap": spx.get("gap"), "fromOpen": spx.get("fromOpen"),
+            "run": run, "runThrough": s.get("through"), "runNow": run_now,
+            "dd52": (spx.get("high52") or {}).get("dd"), "vix": ((doc.get("vol") or {}).get("^VIX") or {}).get("close"),
+            "pctUp": ins.get("pctUp"), "ew": ins.get("ew"), "cw": ins.get("cw"),
+            "date": doc.get("date"), "etTime": doc.get("etTime"), "session": doc.get("state"), "stale": bool(_TREND["stale"])}
+
+
 def credit_exit(pos, today, review_only=False):
     """z194: a long whose issuer falls into distress (CCC+ or worse) closes at once; a long downgraded
     CREDIT_EXIT_NOTCHES+ since entry, or from investment grade to high yield, closes when the next session confirms it
@@ -3730,6 +3814,10 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                 if imult != 1.0:
                     size *= imult                  # z197: conflicted-coverage window after an IPO's quiet period
                     size_why = f"{size_why} · IPO x{imult:.2f} ({iwhy})"
+                tmult, twhy = trend_size_mult(is_short, c.get("etp"), alt)
+                if tmult != 1.0:
+                    size *= tmult                  # z201: today's trends - a sell-off / correction trims new equity longs
+                    size_why = f"{size_why} · trends x{tmult:.2f} ({twhy})"
                 risk_amt = size * eff_stop
                 ok_r, why_r = book.check(c["ticker"], c["sector"], c.get("direction"), size, -size if is_short else size,
                                          beta_v, rets, risk_amt)
@@ -3773,6 +3861,10 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
                 if imult != 1.0:
                     size *= imult                  # z197: conflicted-coverage window after an IPO's quiet period
                     size_why = f"{size_why} · IPO x{imult:.2f} ({iwhy})"
+                tmult, twhy = trend_size_mult(is_short, c.get("etp"), alt)
+                if tmult != 1.0:
+                    size *= tmult                  # z201: today's trends
+                    size_why = f"{size_why} · trends x{tmult:.2f} ({twhy})"
             room = hedge_room if use_hedge else deployable
             size = min(size, room)
             if size < bankroll * MIN_POSITION_PCT:
@@ -3871,6 +3963,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             "warningAtEntry": warning_card((universe.get(c["ticker"]) or {}).get("sector") or c.get("sector"),
                                            (universe.get(c["ticker"]) or {}).get("industry")),   # z196: the early-warning read
             "ipoAtEntry": ipo_card(c["ticker"], today),         # z197: lock-up / quiet-period context (None if not an IPO)
+            "trendsAtEntry": trend_card(),                      # z201: the market read (sell-off, S&P run, breadth) that day
         }
         if option and option.get("legs"):
             # z167: a vertical spread - two legs, one expiry; optionNet is the signed entry value per share
@@ -4454,6 +4547,10 @@ def main():
         load_ipo()                                      # z197: IPO lock-up / quiet-period calendar - gate, size, context
     except Exception as e:
         log(f"IPO calendar unavailable ({type(e).__name__}: {e}) - trades run without it")
+    try:
+        load_trends()                                   # z201: today's trends - the market read: size, context
+    except Exception as e:
+        log(f"today's trends unavailable ({type(e).__name__}: {e}) - trades run without them")
     try:
         load_filings_and_short()
         vol_ctx = volatility_context()
