@@ -180,6 +180,8 @@ class Book:
         self.new_risk = 0.0
         self.new_count = 0
         self.rejects = {}
+        self.long_beta_scale = 1.0      # z202: the long side's net beta cap x this (bot_runner.trend_beta_scale: a sell-off)
+        self.long_beta_why = None
 
     def add(self, ticker, sector, direction, gross, signed, beta_v=None, rets=None, new_risk=0.0, new=False, instrument="shares"):
         s = self.sector.setdefault(sector or "Unknown", {"gross": 0.0, "net": 0.0, "n": 0, "new": 0})
@@ -236,9 +238,11 @@ class Book:
                 why = f"gross cap: {(self.gross + gross) / B:.0%} > {GROSS_CAP:.0%}"
             else:
                 nb = self.net_beta + signed * (beta_v if beta_v is not None else 1.0)
-                cap = NET_BETA_CAP[self.dialed] * B
+                cap = NET_BETA_CAP[self.dialed] * B * (self.long_beta_scale if nb > 0 else 1.0)    # z202: tighter long side in a sell-off
                 if abs(nb) > cap and abs(nb) > abs(self.net_beta):
-                    why = f"net beta cap: {nb / B:+.0%} (cap ±{NET_BETA_CAP[self.dialed]:.0%}, regime {'dialed in' if self.dialed else 'not dialed in'})"
+                    why = (f"net beta cap: {nb / B:+.0%} (cap ±{NET_BETA_CAP[self.dialed]:.0%}, regime {'dialed in' if self.dialed else 'not dialed in'}"
+                           + (f"; long side +{NET_BETA_CAP[self.dialed] * self.long_beta_scale:.0%} - {self.long_beta_why}" if nb > 0 and self.long_beta_scale < 1.0 else "")
+                           + ")")
                 elif self.new_risk + risk > NEW_RISK_PER_DAY * B:
                     why = f"new-risk cap: {(self.new_risk + risk) / B:.2%} of the book today > {NEW_RISK_PER_DAY:.1%}"
         if why:
@@ -255,7 +259,8 @@ class Book:
                 "bySector": {k: round(n / B, 4) for k, n, g in sect},                      # net, signed
                 "bySectorGross": {k: round(g / B, 4) for k, n, g in sect},
                 "overSectorCap": [k for k, n, g in sect if abs(n) > SECTOR_CAP * B and k not in ("Unknown", "")],
-                "newRisk": round(self.new_risk / B, 4), "newTrades": self.new_count, "rejects": dict(self.rejects)}
+                "newRisk": round(self.new_risk / B, 4), "newTrades": self.new_count, "rejects": dict(self.rejects),
+                "longBetaScale": self.long_beta_scale, "longBetaWhy": self.long_beta_why}
 
 
 # ------------------------------------------------------------------------------------------------ sizing ----
