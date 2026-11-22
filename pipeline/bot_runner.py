@@ -436,6 +436,10 @@ def load_universe():
                 "valuationNote": str(r.get("valuationNote") or ""),
                 "valuationZ187": "valuationNote" in r,
                 "financialCurrency": fin or ccy,
+                # z204: Yahoo's denominators as the book wrote them - the as-filed check compares the file's copy with these
+                "revenueUSD": _f(r.get("revenueUSD")),
+                "bookUSD": _f(r.get("bookUSD")),
+                "ebitdaUSD": _f(r.get("ebitdaUSD")),
                 "marketcapUSD": (mc_raw * mc_f) if (mc_raw and mc_f) else None,
                 "finUsd": fin_f,
                 "industry": r.get("industry") or "",
@@ -456,6 +460,10 @@ def load_universe():
         apply_formula_mcap(rows)
     except Exception as e:
         log(f"  formula market caps unavailable ({type(e).__name__}: {e}) - Yahoo's kept")
+    try:                                                     # z204: the multiples checked against the filings (before the medians)
+        apply_as_filed(rows)
+    except Exception as e:
+        log(f"  as-filed check unavailable ({type(e).__name__}: {e}) - Yahoo's multiples kept")
     try:                                                     # z187: sector valuation medians for the relative step
         VAL_STATS.clear()
         VAL_STATS.update(valuation_stats(rows))
@@ -478,6 +486,118 @@ def load_universe():
 # (marketcapYahoo): it relies on Yahoo's count moving with a split.
 SHARES_URL = os.environ.get("RUNNER_SHARES_URL") or f"{RAW}/TRAPP2-ANALYTICS/main/data/sec/shares.json"
 SHARES_GUARD = 0.10
+
+# ------------------------------------------------------------------ z204: the multiples checked against the filings ---
+# TRAPP2-ANALYTICS data/derived/fundamentals.json (pipeline/fundamentals.py): per company the trailing twelve months
+# and the latest balance sheet AS FILED with the SEC (10-K / 10-Q XBRL), compared with Yahoo's figures on the same
+# period, and a pick per denominator: "sec" (verified, the newer filing, or Yahoo has none), "yahoo" (our facts are
+# older), null (DISPUTED - the filing and Yahoo disagree by > 10 % on the same period). The valuation step then:
+#   * leaves out a multiple whose denominator is disputed (P/E <- EPS, P/S <- revenue, P/B <- common equity,
+#     EV/EBITDA <- EBITDA, debt or cash) - a P/S on a revenue figure the filing contradicts is not evidence of value
+#   * where Yahoo has none, or the filing is newer, prices the multiple from the filing's denominator at the row's price
+#   * verified / Yahoo newer: unchanged.
+# Checked at use: when the row's own Yahoo figure no longer matches the one the file was checked against (Yahoo
+# corrected it since), the file's verdict for that field is not applied this pass. USD rows only (the filings are USD).
+FUND_URL = os.environ.get("RUNNER_FUND_URL") or f"{RAW}/TRAPP2-ANALYTICS/main/data/derived/fundamentals.json"
+FUND_MAX_AGE_DAYS = int(os.environ.get("RUNNER_FUND_MAX_AGE_DAYS") or 10)
+AS_FILED_METRICS = (("pe", "pe", ("eps",)), ("ps", "priceToSales", ("rev",)), ("pb", "priceToBook", ("eq",)),
+                    ("evEbitda", "evToEbitda", ("ebitda", "debt", "cash")))
+AS_FILED_BOUNDS = {"pe": (2.0, 1000.0), "ps": (0.01, 200.0), "pb": (0.05, 200.0), "evEbitda": (1.0, 500.0)}   # a multiple
+# priced from a filing nobody else confirmed must be a plausible one (P/E 0.0001 = a share-basis or scale problem)
+_YAHOO_NOW = {"eps": "eps", "rev": "revenueUSD", "eq": "bookUSD", "ebitda": "ebitdaUSD", "debt": "totalDebt", "cash": "cash"}
+
+
+def _as_filed_value(e, key, u):
+    """The filing's figure for a field, in the row's terms (USD; per share for EPS)."""
+    t, b = e.get("t") or {}, e.get("b") or {}
+    if key in ("eps", "rev", "ebitda"):
+        return _f(t.get(key))
+    if key == "cash":
+        return _f(b.get("cashT"))
+    return _f(b.get(key))
+
+
+def apply_as_filed(rows, doc=None, now=None):
+    """rows (load_universe) in place -> counts {"checked", "verified", "fromFiling", "dropped", "moved", "stale"}."""
+    d = doc if doc is not None else fetch_json(FUND_URL, timeout=30)
+    tk = d.get("tickers") if isinstance(d, dict) else None
+    out = {"checked": 0, "verified": 0, "fromFiling": 0, "dropped": 0, "moved": 0, "stale": 0}
+    if not isinstance(tk, dict):
+        return out
+    try:
+        at = datetime.strptime(str(d.get("at") or "")[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        age = ((now or datetime.now(timezone.utc)) - at).days
+    except ValueError:
+        age = None
+    if age is None or age > FUND_MAX_AGE_DAYS:
+        out["stale"] = 1
+        log(f"  as-filed check: TRAPP2-ANALYTICS data/derived/fundamentals.json is {'undated' if age is None else f'{age} days old'} - not used")
+        return out
+    by = {m: {"verified": 0, "fromFiling": 0, "dropped": 0} for m, _, _ in AS_FILED_METRICS}
+    for t, u in rows.items():
+        e = tk.get(t)
+        if not isinstance(e, dict) or str(u.get("currency") or "USD").strip().upper() not in ("USD", "") \
+                or str(u.get("financialCurrency") or "USD").strip().upper() not in ("USD", ""):
+            continue
+        use, y = e.get("use") or {}, e.get("y") or {}
+        px, mc = _f(u.get("price")), _f(u.get("marketcap"))
+        out["checked"] += 1
+        notes = {}
+        for m, field, keys in AS_FILED_METRICS:
+            if not all(k in use for k in keys):
+                continue                                     # the file has nothing to say on this multiple
+            moved = False
+            for k in keys:                                   # Yahoo's figure now vs the one the file was checked against
+                yk = y.get(k) or [None, None, None]
+                yf, yn = yk[0], _f(u.get(_YAHOO_NOW[k]))
+                if yf is not None and yn is not None and yf != 0 and abs(yn / yf - 1) > 0.01:
+                    moved = True
+                if yf is None and yn is not None and yn != 0 and yk[2] == "only":
+                    moved = True                             # Yahoo has a figure now where the file saw none
+            if moved:
+                out["moved"] += 1
+                continue
+            picks = [use.get(k) for k in keys]
+            if any(p is None for p in picks):
+                if u.get(field) is None:
+                    notes[m] = "unconfirmed"                 # Yahoo had none and the filing's can't be confirmed: still none
+                    continue
+                u[field] = None                              # disputed: neither figure for a decision
+                notes[m] = "disputed"
+                by[m]["dropped"] += 1
+                out["dropped"] += 1
+                continue
+            if not all(p == "sec" for p in picks):
+                continue                                     # Yahoo's is the newer (or ours is missing): unchanged
+            bands = [(y.get(k) or [None, None, None])[2] for k in keys]
+            if all(bnd in ("agree", "near") for bnd in bands):
+                by[m]["verified"] += 1
+                out["verified"] += 1
+                notes[m] = "verified"
+                continue
+            vals = [_as_filed_value(e, k, u) for k in keys]  # Yahoo has none / the filing is newer: price ours
+            v = None
+            if m == "pe" and px and vals[0] and vals[0] > 0:
+                v = px / vals[0]
+            elif m in ("ps", "pb") and mc and vals[0] and vals[0] > 0 and not u.get("negBook"):
+                v = mc / vals[0]
+            elif m == "evEbitda" and mc and vals[0] and vals[0] > 0 and vals[1] is not None and vals[2] is not None:
+                v = (mc + vals[1] - vals[2]) / vals[0]
+            lo, hi = AS_FILED_BOUNDS[m]
+            if v and lo <= v <= hi:
+                u[field] = v
+                notes[m] = "filing"
+                by[m]["fromFiling"] += 1
+                out["fromFiling"] += 1
+        if notes:
+            u["asFiled"] = {"multiples": notes, "filed": e.get("filed"), "end": e.get("end")}
+    if out["checked"]:
+        log(f"  as filed (SEC): {out['checked']} USD filers checked against Yahoo - "
+            + " · ".join(f"{m} {c['verified']} verified / {c['fromFiling']} from the filing / {c['dropped']} disputed (not used)"
+                         for m, c in by.items())
+            + (f" · {out['moved']} kept Yahoo's (its figure changed since the check)" if out["moved"] else "")
+            + f" (TRAPP2-ANALYTICS data/derived/fundamentals.json, {d.get('at')})")
+    return out
 
 
 def apply_formula_mcap(rows, doc=None):
@@ -2697,6 +2817,8 @@ def valuation_card(u):
         sec = u.get("sector") or "Unknown"
         st, al = VAL_STATS.get(sec) or {}, VAL_STATS.get("_all") or {}
         out = {"sector": sec, "note": u.get("valuationNote") or None}
+        if u.get("asFiled"):
+            out["asFiled"] = u["asFiled"].get("multiples")             # z204: verified / from the filing / disputed
         for m, k in VAL_METRICS:
             v = f.get(k)
             if v and v > 0:
