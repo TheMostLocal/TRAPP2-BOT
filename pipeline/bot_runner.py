@@ -464,6 +464,10 @@ def load_universe():
         apply_as_filed(rows)
     except Exception as e:
         log(f"  as-filed check unavailable ({type(e).__name__}: {e}) - Yahoo's multiples kept")
+    try:                                                     # z205: the 20-day average dollar volume (liquidity rules)
+        apply_market_stats(rows)
+    except Exception as e:
+        log(f"  market statistics unavailable ({type(e).__name__}: {e}) - no liquidity rule")
     try:                                                     # z187: sector valuation medians for the relative step
         VAL_STATS.clear()
         VAL_STATS.update(valuation_stats(rows))
@@ -499,12 +503,70 @@ SHARES_GUARD = 0.10
 # Checked at use: when the row's own Yahoo figure no longer matches the one the file was checked against (Yahoo
 # corrected it since), the file's verdict for that field is not applied this pass. USD rows only (the filings are USD).
 FUND_URL = os.environ.get("RUNNER_FUND_URL") or f"{RAW}/TRAPP2-ANALYTICS/main/data/derived/fundamentals.json"
+# z205: market statistics from the books' own histories (TRAPP2-ANALYTICS data/derived/market.json, z203): the
+# 20-session average dollar volume each position is sized against (risk_book.liquidity / shortable) and the 63-session
+# average volume - in USD at the row's rate. A file over MARKET_MAX_AGE_DAYS old is not used (no liquidity rule).
+MARKET_URL = os.environ.get("RUNNER_MARKET_URL") or f"{RAW}/TRAPP2-ANALYTICS/main/data/derived/market.json"
+MARKET_MAX_AGE_DAYS = int(os.environ.get("RUNNER_MARKET_MAX_AGE_DAYS") or 7)
 FUND_MAX_AGE_DAYS = int(os.environ.get("RUNNER_FUND_MAX_AGE_DAYS") or 10)
 AS_FILED_METRICS = (("pe", "pe", ("eps",)), ("ps", "priceToSales", ("rev",)), ("pb", "priceToBook", ("eq",)),
                     ("evEbitda", "evToEbitda", ("ebitda", "debt", "cash")))
 AS_FILED_BOUNDS = {"pe": (2.0, 1000.0), "ps": (0.01, 200.0), "pb": (0.05, 200.0), "evEbitda": (1.0, 500.0)}   # a multiple
 # priced from a filing nobody else confirmed must be a plausible one (P/E 0.0001 = a share-basis or scale problem)
 _YAHOO_NOW = {"eps": "eps", "rev": "revenueUSD", "eq": "bookUSD", "ebitda": "ebitdaUSD", "debt": "totalDebt", "cash": "cash"}
+
+
+def liquidity_card(u, notional, option=None):
+    """z205: a trade's size against what the name trades in a day (shares only)."""
+    dv = u.get("dv20USD")
+    if option or not dv:
+        return None
+    return {"dv20": round(dv), "pctOfDay": round(100 * notional / dv, 3) if notional else None, "a63": u.get("a63")}
+
+
+def apply_market_stats(rows, doc=None, now=None):
+    """z205: rows (load_universe) in place - u["dv20USD"] (20-session average dollar volume, USD), u["dv20"] (the quote
+    currency's), u["a63"] (63-session average volume) on stocks and ETFs (a future's, a currency's or an index's volume x
+    price is no notional) -> counts {"rows", "stale" (the file not used), "units" (the history's close and today's quote
+    in different units - skipped)}."""
+    d = doc if doc is not None else fetch_json(MARKET_URL, timeout=30)
+    tk = d.get("tickers") if isinstance(d, dict) else None
+    out = {"rows": 0, "stale": 0, "units": 0}
+    if not isinstance(tk, dict):
+        return out
+    try:
+        at = datetime.strptime(str(d.get("at") or "")[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        age = ((now or datetime.now(timezone.utc)) - at).days
+    except ValueError:
+        age = None
+    if age is None or age > MARKET_MAX_AGE_DAYS:
+        out["stale"] = 1
+        log(f"  market statistics: TRAPP2-ANALYTICS data/derived/market.json is {'undated' if age is None else f'{age} days old'} - no liquidity rule")
+        return out
+    for t, u in rows.items():
+        e = tk.get(t)
+        qs = " ".join(e.get("q") or []) if isinstance(e, dict) else ""
+        if not isinstance(e, dict) or "stale" in qs or "px:" in qs or not rb.equity_like(u):
+            continue                                         # no recent session / its close isn't the book's price
+        dv = _f(e.get("dv20"))
+        if dv is None or dv <= 0:
+            continue
+        fx = _f(u.get("fxRate"))                             # the quote unit -> USD (pence, cents included)
+        if fx is None and str(u.get("currency") or "USD").strip() == "USD":
+            fx = 1.0
+        if not fx:
+            continue                                         # a quote we can't put in dollars: no liquidity figure
+        hp, lp = _f(e.get("px")), _f(u.get("priceLocal"))
+        if hp and lp and not 0.5 <= lp / hp <= 2:
+            out["units"] += 1                                # the history's close and today's quote in different units
+            continue
+        u["dv20"], u["dv20USD"], u["a63"] = dv, dv * fx, _f(e.get("a63"))
+        out["rows"] += 1
+    if out["rows"]:
+        thin = sum(1 for u in rows.values() if u.get("dv20USD") is not None and u.get("scan") and u["dv20USD"] < rb.MIN_DV)
+        log(f"  liquidity: 20-day average dollar volume for {out['rows']} stocks / ETFs (TRAPP2-ANALYTICS data/derived/market.json, {d.get('date')}) "
+            f"- a position <= {rb.LIQ_PCT:.0%} of it, none under ${rb.MIN_DV / 1e3:,.0f}K a day ({thin} scanned names), shorts >= ${rb.MIN_SHORT_DV / 1e6:,.0f}M a day")
+    return out
 
 
 def _as_filed_value(e, key, u):
@@ -4120,8 +4182,18 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             else:
                 stop_pct = SWING_STOP
             ceiling = bankroll * POSITION_PCT * 1.6                          # the pre-z186 maximum stays the maximum
+            liq_u = universe.get(c["ticker"]) or {}
+            liq_cap, liq_skip = rb.liquidity(liq_u) if not alt and hasattr(rb, "liquidity") else (None, None)   # z205 (an older risk_book: no rule)
+            if liq_skip:
+                log(f"  liquidity: skip {c['ticker']} - {liq_skip}")
+                continue
+            liq_bound = liq_cap is not None and liq_cap < ceiling          # z205: <= 2 % of a day's average dollar volume
+            if liq_bound:
+                ceiling = liq_cap
             if book is not None:
                 size, risk_amt, eff_stop, size_why = rb.size_shares(bankroll, conf, stop_pct, sig, rscale, ceiling)
+                if liq_bound and size_why == "size cap":
+                    size_why = f"liquidity cap ({rb.LIQ_PCT:.0%} of ${liq_u['dv20USD'] / 1e6:,.2f}M a day)"
                 if alt:
                     size *= alt["sizeMult"]
                 if explore and not alt:
@@ -4168,15 +4240,16 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             if book is None:
                 # pre-z186: confidence-scaled sizing 0.6x (low) → 1.4x (high), hard-capped at 1.6x base
                 size = min(bankroll * POSITION_PCT * (0.6 + 0.8 * conf), deployable, ceiling)
+                liq_hit = liq_bound and size >= ceiling
                 if alt:
                     size *= alt["sizeMult"]    # smaller + volatility-scaled for crypto / futures
                 if explore and not alt:
                     size *= 0.7                # z138: a first trade in an empty cell is a smaller, exploratory one
-                size_why = "notional"
+                size_why = f"liquidity cap ({rb.LIQ_PCT:.0%} of ${liq_u['dv20USD'] / 1e6:,.2f}M a day)" if liq_hit else "notional"
                 cmult = credit_size_mult(credit_of(c["ticker"]), is_short, c.get("etp"))
                 if cmult != 1.0:
                     size *= cmult                  # z194: weaker credit, smaller long
-                    size_why = f"notional · credit {credit_of(c['ticker']).get('r')} x{cmult:.2f}"
+                    size_why = f"{size_why} · credit {credit_of(c['ticker']).get('r')} x{cmult:.2f}"
                 _u = universe.get(c["ticker"]) or {}
                 wmult, wwhy = warning_size_mult(_u.get("sector") or c.get("sector"), _u.get("industry"), is_short, c.get("etp"))
                 if wmult != 1.0:
@@ -4284,6 +4357,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             "headcount": headcount_of(c["ticker"]),             # z151: context, not scored
             "filings": filings_of(c["ticker"]),                 # z158: 8-K flags, insiders, short selling - context
             "valuation": valuation_card(universe.get(c["ticker"]) or {}),   # z187: the multiples it was judged on
+            "liquidity": liquidity_card(universe.get(c["ticker"]) or {}, notional, option),   # z205: its share of a day's trading
             "creditAtEntry": credit_card(credit_of(c["ticker"])),   # z194: the rating it was opened on (exits measure from it)
             "warningAtEntry": warning_card((universe.get(c["ticker"]) or {}).get("sector") or c.get("sector"),
                                            (universe.get(c["ticker"]) or {}).get("industry")),   # z196: the early-warning read
