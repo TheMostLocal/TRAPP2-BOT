@@ -25,6 +25,9 @@
 #  never allowed is unwound by the runner (RUNNER_UNWIND_UNSHORTABLE).
 #  z192: etp_exposure() - a leveraged / inverse product's signed daily leverage and what it tracks, and etp_drag() -
 #  what holding it past one session costs (the runner signs its market signals and manages it session by session).
+#  z205: liquidity() - a position is a small share of what trades in a day: at most LIQ_PCT of the 20-session average
+#  dollar volume (TRAPP2-ANALYTICS data/derived/market.json, the runner's u["dv20USD"]), none in a name trading under
+#  MIN_DV a day; a short sale also needs MIN_SHORT_DV a day (borrow, a clean cover). Equities / ETFs only.
 # ============================================================
 import math
 import os
@@ -57,6 +60,9 @@ DD_WINDOW = int(_envf("RUNNER_RISK_DD_WINDOW", 90))                # high-water 
 DD_STEPS = ((0.04, 1.00), (0.08, 0.70), (0.12, 0.50), (9.99, 0.35))   # drawdown -> scale on new risk
 MIN_SHORT_PRICE = _envf("RUNNER_RISK_MIN_SHORT_PX", 10)            # no short sales under $10 ...
 MIN_SHORT_CAP = _envf("RUNNER_RISK_MIN_SHORT_CAP", 2e9)            # ... or under a $2B market cap (borrow, squeezes)
+LIQ_PCT = _envf("RUNNER_RISK_LIQ_PCT", 2.0) / 100                  # z205: one position <= 2 % of a day's average dollar volume
+MIN_DV = _envf("RUNNER_RISK_MIN_DV", 250e3)                        # ... no new position under $250K traded a day
+MIN_SHORT_DV = _envf("RUNNER_RISK_MIN_SHORT_DV", 10e6)             # ... no short sale under $10M a day
 # z190: a fund is recognised by ANY sign of one. TRAPP2-1 (the macro book) lists only funds / ETPs among its US symbols
 # (plus foreign listings, FX, crypto, futures, indices); on 11-16 a throttled Yahoo answer blanked their profiles (no
 # name, isetf "false", no market cap) and the runner shorted GLD, SOXL (3x), TAN and WGMI as if they were stocks.
@@ -369,10 +375,34 @@ def etp_drag(lev, etp_daily_vol):
     return (lev * lev - lev) / 2.0 * (v / abs(lev)) ** 2
 
 
+def liquidity(u):
+    """z205 -> (notional cap, skip reason). The 20-session average dollar volume in USD (u["dv20USD"]): under MIN_DV a
+    day -> (0, why) - no new position; else (LIQ_PCT x it, None). Unknown (no file, a future / currency / index, whose
+    volume x price is no notional) -> (None, None): no liquidity rule."""
+    dv = u.get("dv20USD")
+    if dv is None or not equity_like(u):
+        return None, None
+    if dv < MIN_DV:
+        return 0.0, f"thin: ${dv / 1e3:,.0f}K traded a day on average (< ${MIN_DV / 1e3:,.0f}K)"
+    return LIQ_PCT * dv, None
+
+
+_NOT_EQUITY = re.compile(r"^\^|=F$|=X$|-USD$|^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+
+
+def equity_like(u):
+    """A stock or an ETF (what trades on an exchange with a share volume): not a future, currency, index, crypto pair or
+    option contract - their volume x price is not what the position would be a share of."""
+    t = str(u.get("ticker") or "").upper()
+    cls = str(u.get("assetClass") or "Equity").strip().lower()
+    return cls in ("equity", "etf", "") and not _NOT_EQUITY.search(t)
+
+
 def shortable(u):
     """A short sale needs a liquid, borrowable single stock (§1d 3): not a fund or an ETP, >= $10, and a market cap we
     KNOW is >= $2B (in USD - z190: an unknown cap no longer passes). Paper trading has no borrow desk; this keeps the
-    shorts realistic. A name that fails gets a put instead, when it has an option chain."""
+    shorts realistic. A name that fails gets a put instead, when it has an option chain. z205: and, when its average
+    dollar volume is known, >= MIN_SHORT_DV a day."""
     why = fund_reason(u)
     if why:
         return False, f"{why} - no single-name short"
@@ -384,6 +414,9 @@ def shortable(u):
         return False, "market cap unknown - can't confirm a $2B+ company"
     if mc < MIN_SHORT_CAP:
         return False, f"market cap ${mc / 1e9:.1f}B < ${MIN_SHORT_CAP / 1e9:.0f}B"
+    dv = u.get("dv20USD")
+    if dv is not None and dv < MIN_SHORT_DV:
+        return False, f"${dv / 1e6:.1f}M traded a day < ${MIN_SHORT_DV / 1e6:.0f}M (borrow, a clean cover)"
     return True, ""
 
 
@@ -400,4 +433,5 @@ def knobs():
             "sectorCap": SECTOR_CAP, "sectorGrossCap": SECTOR_GROSS_CAP, "sectorNewMax": SECTOR_NEW_MAX, "clusterCorr": CLUSTER_CORR, "clusterMax": CLUSTER_MAX,
             "netBetaCap": {"notDialedIn": NET_BETA_CAP[False], "dialedIn": NET_BETA_CAP[True]}, "grossCap": GROSS_CAP,
             "newRiskPerDay": NEW_RISK_PER_DAY, "posLossCap": POS_LOSS_CAP, "dayHalt": DAY_HALT,
-            "drawdownSteps": [list(x) for x in DD_STEPS], "ddWindow": DD_WINDOW}
+            "drawdownSteps": [list(x) for x in DD_STEPS], "ddWindow": DD_WINDOW,
+            "liquidity": {"pctOfDay": LIQ_PCT, "minDollarVolume": MIN_DV, "minShortDollarVolume": MIN_SHORT_DV}}
