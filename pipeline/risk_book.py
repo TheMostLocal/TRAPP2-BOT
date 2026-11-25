@@ -28,6 +28,10 @@
 #  z205: liquidity() - a position is a small share of what trades in a day: at most LIQ_PCT of the 20-session average
 #  dollar volume (TRAPP2-ANALYTICS data/derived/market.json, the runner's u["dv20USD"]), none in a name trading under
 #  MIN_DV a day; a short sale also needs MIN_SHORT_DV a day (borrow, a clean cover). Equities / ETFs only.
+#  z206: shortable(u, covering) - no new short sale into a CROWDED short: MAX_SHORT_SI (20 %) or more of the float sold
+#  short already (borrow cost, recalls, squeeze risk), and SQUEEZE_SHORT_SI (10 %) while the tape shows shorts being
+#  covered (TRAPP2-ANALYTICS' flows: a short-covering rally today, or the session after one). The name gets a put
+#  instead, when it has an option chain.
 # ============================================================
 import math
 import os
@@ -63,6 +67,8 @@ MIN_SHORT_CAP = _envf("RUNNER_RISK_MIN_SHORT_CAP", 2e9)            # ... or unde
 LIQ_PCT = _envf("RUNNER_RISK_LIQ_PCT", 2.0) / 100                  # z205: one position <= 2 % of a day's average dollar volume
 MIN_DV = _envf("RUNNER_RISK_MIN_DV", 250e3)                        # ... no new position under $250K traded a day
 MIN_SHORT_DV = _envf("RUNNER_RISK_MIN_SHORT_DV", 10e6)             # ... no short sale under $10M a day
+MAX_SHORT_SI = _envf("RUNNER_RISK_MAX_SHORT_SI", 20.0) / 100       # z206: no short sale where 20 %+ of the float is short
+SQUEEZE_SHORT_SI = _envf("RUNNER_RISK_SQUEEZE_SHORT_SI", 10.0) / 100   # ... 10 %+ while shorts are being covered
 # z190: a fund is recognised by ANY sign of one. TRAPP2-1 (the macro book) lists only funds / ETPs among its US symbols
 # (plus foreign listings, FX, crypto, futures, indices); on 11-16 a throttled Yahoo answer blanked their profiles (no
 # name, isetf "false", no market cap) and the runner shorted GLD, SOXL (3x), TAN and WGMI as if they were stocks.
@@ -398,11 +404,12 @@ def equity_like(u):
     return cls in ("equity", "etf", "") and not _NOT_EQUITY.search(t)
 
 
-def shortable(u):
+def shortable(u, covering=False):
     """A short sale needs a liquid, borrowable single stock (§1d 3): not a fund or an ETP, >= $10, and a market cap we
     KNOW is >= $2B (in USD - z190: an unknown cap no longer passes). Paper trading has no borrow desk; this keeps the
     shorts realistic. A name that fails gets a put instead, when it has an option chain. z205: and, when its average
-    dollar volume is known, >= MIN_SHORT_DV a day."""
+    dollar volume is known, >= MIN_SHORT_DV a day. z206: and not a crowded short - short interest (Yahoo's short % of
+    float) under MAX_SHORT_SI, under SQUEEZE_SHORT_SI while the tape shows shorts being covered (covering=True)."""
     why = fund_reason(u)
     if why:
         return False, f"{why} - no single-name short"
@@ -417,6 +424,11 @@ def shortable(u):
     dv = u.get("dv20USD")
     if dv is not None and dv < MIN_SHORT_DV:
         return False, f"${dv / 1e6:.1f}M traded a day < ${MIN_SHORT_DV / 1e6:.0f}M (borrow, a clean cover)"
+    si = u.get("shortPctFloat")
+    bar = SQUEEZE_SHORT_SI if covering else MAX_SHORT_SI
+    if si is not None and 0 < si <= 1.0 and si >= bar:
+        return False, (f"{si:.0%} of the float already sold short (>= {bar:.0%}"
+                       + (" while shorts are being covered" if covering else "") + ") - a crowded short")
     return True, ""
 
 
@@ -434,4 +446,5 @@ def knobs():
             "netBetaCap": {"notDialedIn": NET_BETA_CAP[False], "dialedIn": NET_BETA_CAP[True]}, "grossCap": GROSS_CAP,
             "newRiskPerDay": NEW_RISK_PER_DAY, "posLossCap": POS_LOSS_CAP, "dayHalt": DAY_HALT,
             "drawdownSteps": [list(x) for x in DD_STEPS], "ddWindow": DD_WINDOW,
-            "liquidity": {"pctOfDay": LIQ_PCT, "minDollarVolume": MIN_DV, "minShortDollarVolume": MIN_SHORT_DV}}
+            "liquidity": {"pctOfDay": LIQ_PCT, "minDollarVolume": MIN_DV, "minShortDollarVolume": MIN_SHORT_DV},
+            "shortCrowding": {"maxShortPctFloat": MAX_SHORT_SI, "whileCovering": SQUEEZE_SHORT_SI}}
