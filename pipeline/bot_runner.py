@@ -1319,6 +1319,32 @@ _OPT_SIGNALS = {"doc": None}
 OPT_SIGNAL_MAX_AGE_DAYS = 5
 
 
+# z208: an option chain fetched with no live quotes (TRAPP2-OPTIONS' 0327 ET 11-24 broad pass) carries Yahoo's placeholder
+# IVs - 1e-05 or a power of two (6.25 %, 3.125 %, 1.5625 % ...) - which the IV anchors read as "calm" (+0.5): 1,435 names
+# got a bullish options tilt from them. No quote, no IV; a placeholder or an IV under MIN_OPT_IV is no reading.
+MIN_OPT_IV = 0.03
+_PLACEHOLDER_IV = {0.0625, 0.0313, 0.0312, 0.0156, 0.0078, 0.0039}
+
+
+def _placeholder_iv(v):
+    if not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v < MIN_OPT_IV:
+        return True
+    if v <= 0.0625:
+        k = math.log2(v)
+        return abs(k - round(k)) < 1e-9 or round(v, 4) in _PLACEHOLDER_IV
+    return False
+
+
+def _live_iv(o):
+    """A contract's IV when it has a quote (bid or ask > 0) and is not a placeholder, else None."""
+    if not o:
+        return None
+    v = o.get("iv")
+    if _placeholder_iv(v) or ((o.get("bid") or 0) <= 0 and (o.get("ask") or 0) <= 0):
+        return None
+    return v
+
+
 def _opt_signal_row(ticker):
     """z196: TRAPP2-OPTIONS signals.json - every name's extractOptionsSignal, computed by the pipeline from the same
     chain (one file a pass instead of one chain per candidate; ~2,300 names since z196). None if absent or stale."""
@@ -1326,8 +1352,8 @@ def _opt_signal_row(ticker):
         d = fetch_json(OPTIONS_SIGNALS_URL, timeout=30)
         _OPT_SIGNALS["doc"] = (d.get("tickers") if isinstance(d, dict) else None) or {}
     row = _OPT_SIGNALS["doc"].get(str(ticker).upper())
-    if not isinstance(row, list) or len(row) < 6 or row[0] is None:
-        return None
+    if not isinstance(row, list) or len(row) < 6 or row[0] is None or _placeholder_iv(row[0]):
+        return None                                           # z208: a placeholder IV is no reading
     try:
         age = ((NOW_UTC or datetime.now(timezone.utc)).date() - datetime.strptime(str(row[5])[:10], "%Y-%m-%d").date()).days
     except (TypeError, ValueError):
@@ -1356,19 +1382,20 @@ def extract_options_signal(ticker):
     if not ref:
         return None
     atm_call, atm_put = _atm(ref.get("calls"), spot), _atm(ref.get("puts"), spot)
-    ivs = [x.get("iv") for x in (atm_call, atm_put) if x and x.get("iv") is not None and isfinite_num(x.get("iv"))]
+    ic, ip = _live_iv(atm_call), _live_iv(atm_put)              # z208: no quote / a placeholder -> no IV
+    ivs = [x for x in (ic, ip) if x is not None and isfinite_num(x)]
     if not ivs:
         return None
     iv = sum(ivs) / len(ivs)
     skew = None
-    if atm_put and atm_call and atm_put.get("iv") is not None and atm_call.get("iv") is not None:
-        skew = atm_put["iv"] - atm_call["iv"]
+    if ip is not None and ic is not None:
+        skew = ip - ic
     term_slope = None
     far = next((e for e in exps if (e.get("dte") or 0) >= 100), None)
     if far:
-        far_atm = _atm(far.get("calls"), spot)
-        if far_atm and far_atm.get("iv") is not None and isfinite_num(far_atm.get("iv")):
-            term_slope = iv - far_atm["iv"]
+        fiv = _live_iv(_atm(far.get("calls"), spot))
+        if fiv is not None and isfinite_num(fiv):
+            term_slope = iv - fiv
     # Map to a signed signal (same anchors as the app).
     iv_signal = 0.0
     if iv > 0.45:
