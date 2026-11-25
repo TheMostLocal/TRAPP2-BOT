@@ -118,6 +118,17 @@ class Flows(Base):
         self.load(doc(proxy="SPY"))
         self.assertEqual(br.trend_card()["proxy"], "SPY")
 
+    def test_dealer_gamma_is_recorded(self):
+        # z209: the trends doc's flows.dealer (TRAPP2-OPTIONS, SPY's open interest x gamma) on every trade's record
+        d = doc()
+        d["flows"]["dealer"] = {"SPY": {"gex": -6181258143, "flip": 727.85, "flipPct": 1.47, "spot": 717.28,
+                                        "change": {"putChgPct": -6.3, "callChgPct": 2.0, "common": 7}}}
+        self.load(d)
+        self.assertEqual(br.flows_card()["dealer"], {"gex": -6181258143, "flip": 727.85, "flipPct": 1.47, "putOIChg": -6.3})
+        self.setUp()
+        self.load(doc())
+        self.assertIsNone(br.flows_card()["dealer"])
+
 
 class Wired(unittest.TestCase):
     def test_wiring(self):
