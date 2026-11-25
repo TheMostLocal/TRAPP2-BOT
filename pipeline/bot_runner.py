@@ -407,6 +407,7 @@ def load_universe():
                 "repo": repo,
                 "changepct": _f(r.get("changepct")),
                 "beta": _f(r.get("beta")),
+                "shortPctFloat": _f(r.get("shortPctFloat")),          # z206: crowded shorts (risk_book.shortable)
                 # Fundamentals carried through for the ported reasoning-chain /
                 # health engine (same fields the app's stockbook rows expose).
                 "marketcap": _f(r.get("marketcap")),
@@ -1945,10 +1946,14 @@ def load_trends():
     if doc:
         c = trend_card() or {}
         m, why = trend_size_mult()
+        fc = flows_card() or {}
         log(f"today's trends: {c.get('label')} ({c.get('on')} of {c.get('of')}) · S&P 500 {c.get('spxChg')}% "
-            f"({'final' if c.get('spxFinal') else 'provisional ' + str(c.get('etTime') or '')}) · run {c.get('run')} through "
+            + (f"[read on {c.get('proxy')} - the macro book is out] " if c.get("proxy") else "")
+            + f"({'final' if c.get('spxFinal') else 'provisional ' + str(c.get('etTime') or '')}) · run {c.get('run')} through "
             f"{c.get('runThrough')}" + (f" ({age} day(s) old)" if age else "")
-            + (" - STALE: context only" if stale else f" · new equity longs x{m:.2f}" if m != 1.0 else " · no size change"))
+            + (" - STALE: context only" if stale else f" · new equity longs x{m:.2f}" if m != 1.0 else " · no size change")
+            + (f" · positioning: {fc.get('label') or 'no signal'}"
+               + (" - shorts being covered: no new short where 10%+ of the float is short" if covering_now() else "") if fc else ""))
     else:
         log("today's trends: no read yet (TRAPP2-ANALYTICS data/trends/latest.json) - trades run without it")
     return _TREND
@@ -2083,6 +2088,32 @@ def trend_evidence(state):
     return out
 
 
+# z206 - WHO WAS FORCED TO TRADE (owner 11-24: "yesterday was covering shorts for major hedges ... make sure things
+# like this are being noticed"). TRAPP2-ANALYTICS' trends doc now carries "flows": the factor baskets (the most-shorted
+# 50, 12-1 momentum, the week's losers vs winners, high vs low beta) priced from the tapes, each in sd of its year, with
+# the index tells -> a label (short-covering rally, de-grossing, risk-off rotation ...). In the bot:
+#   * flows on every trade (trendsAtEntry.flows) - the record that will say whether entering on such days paid
+#   * no new short sale into a crowded short (risk_book.shortable): 20 %+ of the float short, 10 %+ while shorts are
+#     being covered - a short-covering rally today, or the session after one (covering_now()) - a put instead
+def flows_card():
+    """The tape's positioning read from the trends doc (None when absent or stale) - compact, for the journal."""
+    doc = None if _TREND.get("stale") else _TREND.get("doc")
+    fl = (doc or {}).get("flows") or {}
+    if not fl or fl.get("date") != (doc or {}).get("date"):
+        return None
+    return {"label": fl.get("label"), "z": fl.get("z"), "flags": sorted((fl.get("flags") or {}).keys()),
+            "after": (fl.get("after") or {}).get("prior"), "provisional": bool(fl.get("provisional")), "source": fl.get("source")}
+
+
+def covering_now():
+    """z206: shorts are being covered - today's flows read a short-covering rally (or the most-shorted squeezed), or
+    today is the session after one (flows.after). False when the trends doc is absent or stale."""
+    c = flows_card()
+    if not c:
+        return False
+    return c.get("label") == "short-covering rally" or "squeeze" in (c.get("flags") or []) or bool(c.get("after"))
+
+
 def trend_card():
     """Today's market read on the trade date, for the journal (None before the first trends run)."""
     doc = _TREND.get("doc")
@@ -2104,6 +2135,7 @@ def trend_card():
             "dd52": (spx.get("high52") or {}).get("dd"), "vix": ((doc.get("vol") or {}).get("^VIX") or {}).get("close"),
             "pctUp": ins.get("pctUp"), "ew": ins.get("ew"), "cw": ins.get("cw"),
             "date": doc.get("date"), "etTime": doc.get("etTime"), "session": doc.get("state"), "stale": bool(_TREND["stale"]),
+            "flows": flows_card(), "proxy": (doc.get("proxy") or {}).get("^GSPC"),           # z206
             "atOpen": (lambda m: {k: m.get(k) for k in ("state", "on", "of", "asOf", "run", "dd")} if m else None)(
                 read_at_open(datetime.now(timezone.utc).strftime("%Y-%m-%d") if NOW_UTC is None else NOW_UTC.strftime("%Y-%m-%d")))}
 
@@ -3954,7 +3986,7 @@ def open_new_trades(state, universe, today, regime, grades, peer_ranks, xa, quad
             # z138: a bearish idea trades as a short sale (RUNNER_ALLOW_SHORTS) or as a put - defined risk
             # z186: shorts on by default; a short sale needs a liquid, borrowable stock (else a put, if a chain exists).
             # Collected here; the session's short bar (absolute OR bottom decile) is applied after the scan.
-            can_short, short_why = rb.shortable(u) if ALLOW_SHORTS else (False, "shorts off")
+            can_short, short_why = rb.shortable(u, covering=covering_now()) if ALLOW_SHORTS else (False, "shorts off")
             if not can_short and not tb.chain_fresh(_load_option_chain(tk), today):
                 if signed <= SHORT_SCORE:
                     bear.append((signed, tk, f"not shortable ({short_why}) and no option chain"))
