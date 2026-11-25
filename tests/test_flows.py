@@ -77,7 +77,9 @@ class Crowding(unittest.TestCase):
         self.assertNotIn("crowded", why)
 
     def test_knobs(self):
-        self.assertEqual(rb.knobs()["shortCrowding"], {"maxShortPctFloat": rb.MAX_SHORT_SI, "whileCovering": rb.SQUEEZE_SHORT_SI})
+        k = rb.knobs()["shortCrowding"]
+        self.assertEqual((k["maxShortPctFloat"], k["whileCovering"]), (rb.MAX_SHORT_SI, rb.SQUEEZE_SHORT_SI))
+        self.assertEqual(k["finra"]["maxShortPctShares"], rb.MAX_SHORT_SO)                      # z207: FINRA first
 
 
 class Flows(Base):
