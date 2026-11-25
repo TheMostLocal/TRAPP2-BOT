@@ -2130,7 +2130,9 @@ def load_trends():
                + (f" - shorts being covered: no new short where {rb.SQUEEZE_SHORT_SO:.0%}+ of the shares are short or "
                   f"{rb.SQUEEZE_SHORT_DTC:.0f}+ days to cover (FINRA)" if covering_now() else "")
                + (f" · FINRA settled {fc['reported']['settle']}: the 50 most-shorted {fc['reported']['basketChg']:+.1f}% dollars short"
-                  if (fc.get("reported") or {}).get("basketChg") is not None else "") if fc else ""))
+                  if (fc.get("reported") or {}).get("basketChg") is not None else "")
+               + (f" · dealer gamma (SPY) {fc['dealer']['gex'] / 1e9:+.1f}B per 1%" + (f", flip {fc['dealer']['flipPct']:+.1f}%" if fc['dealer'].get('flipPct') is not None else "")
+                  if (fc.get("dealer") or {}).get("gex") is not None else "") if fc else ""))
     else:
         log("today's trends: no read yet (TRAPP2-ANALYTICS data/trends/latest.json) - trades run without it")
     return _TREND
@@ -2279,11 +2281,15 @@ def flows_card():
     if not fl or fl.get("date") != (doc or {}).get("date"):
         return None
     rp = fl.get("reported") or {}
+    dl = (fl.get("dealer") or {}).get("SPY") or {}
     return {"label": fl.get("label"), "z": fl.get("z"), "flags": sorted((fl.get("flags") or {}).keys()),
             "after": (fl.get("after") or {}).get("prior"), "provisional": bool(fl.get("provisional")), "source": fl.get("source"),
             # z207: FINRA's latest settlement beside the price signature - what shorts DID, about two weeks behind
             "reported": {"settle": rp.get("settle"), "basketChg": (rp.get("basket") or {}).get("chg"),
-                         "universeChg": (rp.get("universe") or {}).get("chg"), "partial": bool(rp.get("partial"))} if rp.get("settle") else None}
+                         "universeChg": (rp.get("universe") or {}).get("chg"), "partial": bool(rp.get("partial"))} if rp.get("settle") else None,
+            # z209: dealer gamma from SPY's open interest (TRAPP2-OPTIONS via the trends doc) - recorded on every trade
+            "dealer": {"gex": dl.get("gex"), "flip": dl.get("flip"), "flipPct": dl.get("flipPct"),
+                       "putOIChg": (dl.get("change") or {}).get("putChgPct")} if dl.get("gex") is not None else None}
 
 
 def covering_now():
