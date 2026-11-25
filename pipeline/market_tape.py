@@ -18,6 +18,7 @@ from datetime import date, datetime, timedelta
 
 RAW = "https://raw.githubusercontent.com/TheMostLocal"
 HIST = RAW + "/TRAPP2-1/main/data/history/{}.json"
+HIST_FALLBACK = RAW + "/TRAPP2/main/data/history/{}.json"     # z206: the macro book out
 TRENDS_URL = RAW + "/TRAPP2-ANALYTICS/main/data/trends/latest.json"
 SPX, VIX, HYG, SPY = "^GSPC", "^VIX", "HYG", "SPY"
 STATES = ((0, "calm"), (2, "pressure"), (3, "selloff"))
@@ -56,11 +57,25 @@ def series(rows):
 
 
 def load_histories(fetch=None):
-    """{'spx', 'vix', 'hyg', 'spy'} -> (dates, closes, volumes) from TRAPP2-1 (one request each, ~300 KB)."""
+    """{'spx', 'vix', 'hyg', 'spy'} -> (dates, closes, volumes) from TRAPP2-1 (one request each, ~300 KB). z206: when the
+    macro book can't be read (11-24: every TRAPP2-1 file 404), SPY and HYG from TRAPP2 and SPY standing in for the
+    S&P 500 (its volume for the distribution days); no VIX - that criterion is then simply not counted. 'src' says
+    what stood in."""
     fetch = fetch or _get
     out = {}
     for k, sym in (("spx", SPX), ("vix", VIX), ("hyg", HYG), ("spy", SPY)):
         out[k] = series(fetch(HIST.format(urllib.parse.quote(sym, safe=""))))
+    src = {}
+    for k, sym in (("spy", SPY), ("hyg", HYG)):
+        if not out[k][0]:
+            out[k] = series(fetch(HIST_FALLBACK.format(sym)))
+            if out[k][0]:
+                src[k] = f"TRAPP2 {sym}"
+    if not out["spx"][0] and out["spy"][0]:
+        out["spx"] = out["spy"]
+        src["spx"] = "SPY (TRAPP2)"
+    if src:
+        out["src"] = src
     return out
 
 
