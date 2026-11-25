@@ -51,6 +51,7 @@ import os
 import trade_sync as ts
 import market_hours as mh   # z121: the NYSE regular session (ET) - the only time the bot trades
 import sys
+import urllib.parse
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
@@ -461,6 +462,10 @@ def load_universe():
         apply_formula_mcap(rows)
     except Exception as e:
         log(f"  formula market caps unavailable ({type(e).__name__}: {e}) - Yahoo's kept")
+    try:                                                     # z207: FINRA's short interest (after the share counts)
+        apply_short_interest(rows)
+    except Exception as e:
+        log(f"  short interest (FINRA) unavailable ({type(e).__name__}: {e}) - Yahoo's short % of float stands in")
     try:                                                     # z204: the multiples checked against the filings (before the medians)
         apply_as_filed(rows)
     except Exception as e:
@@ -490,6 +495,19 @@ def load_universe():
 # Yahoo's figure stays for that pass. The split check in the position reviews keeps reading YAHOO's market cap
 # (marketcapYahoo): it relies on Yahoo's count moving with a split.
 SHARES_URL = os.environ.get("RUNNER_SHARES_URL") or f"{RAW}/TRAPP2-ANALYTICS/main/data/sec/shares.json"
+# z207: FINRA's official short interest (TRAPP2-ANALYTICS data/short/index.json, pipeline/fetch_short.py): shares short
+# at the latest settlement over the share count apply_formula_mcap trusts -> u["shortPctSO"], u["daysToCover"],
+# u["shortChgPct"], u["shortSettle"], u["shortVolZ"] (Reg SHO short share of volume vs its 20 sessions). The crowded-
+# short rule (risk_book.crowded_short) reads these first; Yahoo's short % of float only where FINRA has none.
+SHORT_URL = os.environ.get("RUNNER_SHORT_URL") or f"{RAW}/TRAPP2-ANALYTICS/main/data/short/index.json"
+SHORT_MAX_AGE_DAYS = 35         # a settlement older than this (two missed publications) is not used
+# z207: an open position no book prices this pass (the macro book TRAPP2-1 unreadable since 11-24 left PBRG, ZSL and SH
+# with no quote - "WAIT: no fresh quote" every pass) is priced from Yahoo's own chart endpoint: at most ORPHAN_MAX
+# symbols, USD only, a quote at most ORPHAN_MAX_AGE_D days old, stamped with Yahoo's own trade time (so the 30-minute
+# freshness rule still decides whether it can act). Price-only rows: stops, targets, trims and the loss cap act; no
+# re-score and no horizon exit on a signal that couldn't be read. pos["unpricedSince"] marks a position with no price.
+YAHOO_CHART = os.environ.get("RUNNER_YAHOO_CHART") or "https://query1.finance.yahoo.com/v8/finance/chart/{t}?range=5d&interval=1d"
+ORPHAN_MAX, ORPHAN_MAX_AGE_D = 20, 4
 SHARES_GUARD = 0.10
 
 # ------------------------------------------------------------------ z204: the multiples checked against the filings ---
@@ -683,12 +701,141 @@ def apply_formula_mcap(rows, doc=None):
         r["marketcapYahoo"] = ym
         r["marketcap"] = r["marketcapUSD"] = px * sh
         r["mcapSource"] = f"{e.get('p')}:{e.get('st')}"
+        r["sharesOut"] = sh                                     # z207: the denominator for FINRA's shares short
         out["sec" if e.get("p") == "sec" else "yahoo"] += 1
     if any(out.values()):
         log(f"  market cap = price x shares: {out['sec']} on the SEC's own count, {out['yahoo']} on Yahoo's"
             + (f", {out['moved']} kept Yahoo's (its count moved > {SHARES_GUARD:.0%} since the file - a split / issue?)" if out["moved"] else "")
             + f" (TRAPP2-ANALYTICS data/sec/shares.json {d.get('date') or ''})")
     return out
+
+
+def apply_short_interest(rows, doc=None, today=None):
+    """z207: rows (load_universe) in place - FINRA's shares short at the latest settlement, as a share of the trusted
+    share count (u["sharesOut"], apply_formula_mcap), days to cover, the change since the settlement before, the day's
+    short-volume z. -> {"names": n, "pctShares": n, "crowded": n, "settle": newest, "stale": n}."""
+    d = doc if doc is not None else fetch_json(SHORT_URL, timeout=45)
+    iv = d.get("interest") if isinstance(d, dict) else None
+    out = {"names": 0, "pctShares": 0, "crowded": 0, "settle": None, "stale": 0}
+    if not isinstance(iv, dict) or not iv:
+        log("  short interest (FINRA): none this pass - Yahoo's short % of float stands in for the crowded-short rule")
+        return out
+    today = today or datetime.now(timezone.utc).date()
+    vol = d.get("volume") if isinstance(d.get("volume"), dict) else {}
+    for t, r in rows.items():
+        e = iv.get(t)
+        if not isinstance(e, dict):
+            continue
+        sd = str(e.get("settlementDate") or "")[:10]
+        try:
+            age = (today - datetime.strptime(sd, "%Y-%m-%d").date()).days
+        except ValueError:
+            continue
+        sh = _f(e.get("shares"))
+        if sh is None or sh < 0:
+            continue
+        if age > SHORT_MAX_AGE_DAYS:
+            out["stale"] += 1
+            continue
+        so = _f(r.get("sharesOut"))
+        r.update(shortShares=sh, shortSettle=sd, daysToCover=_f(e.get("daysToCover")),
+                 shortChgPct=None if e.get("split") else _f(e.get("changePct")))
+        if so and so > 0 and sh / so <= 1.0:
+            r["shortPctSO"] = sh / so
+            out["pctShares"] += 1
+        v = vol.get(t)
+        if isinstance(v, dict) and _f(v.get("z")) is not None:
+            r["shortVolZ"] = _f(v.get("z"))
+        out["names"] += 1
+        out["settle"] = max(out["settle"] or sd, sd)
+        if r.get("scan") and rb.crowded_short(r)[0]:
+            out["crowded"] += 1
+    log(f"  short interest (FINRA, newest settlement {out['settle'] or '—'}): {out['names']} names, {out['pctShares']} as a share "
+        f"of their shares outstanding; {out['crowded']} scannable names are crowded shorts (>= {rb.MAX_SHORT_SO:.0%} of the shares "
+        f"or {rb.MAX_SHORT_DTC:.0f}+ days to cover) - no new short sale there"
+        + (f"; {out['stale']} on a settlement over {SHORT_MAX_AGE_DAYS} days old, not used" if out["stale"] else ""))
+    return out
+
+
+def _yahoo_chart(t):
+    """Yahoo's v8 chart result for one symbol (5 sessions of daily bars and the live meta), or None."""
+    url = YAHOO_CHART.format(t=urllib.parse.quote(t, safe="=^-."))
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (valuatio-bot-runner)", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        doc = json.loads(r.read().decode("utf-8", "replace"))
+    res = (doc.get("chart") or {}).get("result") or []
+    return res[0] if res else None
+
+
+_YAHOO_TYPES = {"EQUITY": "Equity", "ETF": "ETF", "FUTURE": "Future", "CRYPTOCURRENCY": "Crypto", "MUTUALFUND": "Fund",
+                "INDEX": "Index", "CURRENCY": "FX"}
+
+
+def orphan_row(t, res, now_utc):
+    """A price-only universe row from Yahoo's chart result, or (None, why)."""
+    meta = (res or {}).get("meta") or {}
+    px, ts = _f(meta.get("regularMarketPrice")), meta.get("regularMarketTime")
+    ccy = str(meta.get("currency") or "").strip()
+    if not px or px <= 0 or not ts:
+        return None, "no price"
+    if ccy != "USD":                                            # GBp, EUR ... (and "usd" is not Yahoo's spelling)
+        return None, f"quoted in {ccy or 'an unknown currency'}"
+    at = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    if (now_utc - at).total_seconds() > ORPHAN_MAX_AGE_D * 86400:
+        return None, f"last trade {at:%Y-%m-%d} - older than {ORPHAN_MAX_AGE_D} days"
+    # the prior session's close: the last daily bar dated before the quote's day (bars are stamped at the open, UTC)
+    q = (((res.get("indicators") or {}).get("quote") or [{}])[0] or {}).get("close") or []
+    prev = None
+    for bt, c in zip(res.get("timestamp") or [], q):
+        if isinstance(c, (int, float)) and c > 0 and datetime.fromtimestamp(int(bt), tz=timezone.utc).date() < at.date():
+            prev = c
+    it = str(meta.get("instrumentType") or "").strip().upper()
+    return {"ticker": t, "price": round(px, 6), "priceLocal": px, "currency": "USD", "fxRate": 1.0, "scan": False,
+            "asOf": at.isoformat(timespec="seconds"), "assetClass": _YAHOO_TYPES.get(it, it.title() or None),
+            "isetf": "true" if it == "ETF" else "", "isfund": "true" if it == "MUTUALFUND" else "",
+            "sector": "Unknown", "name": meta.get("longName") or meta.get("shortName") or t, "repo": None,
+            "changepct": round((px / prev - 1) * 100, 3) if prev else None, "beta": None, "marketcap": None,
+            "priceOnly": True, "priceSource": "yahoo-direct"}, ""
+
+
+def price_orphans(universe, state, now_utc, fetch=None):
+    """z207: open positions with no row in any book this pass, priced from Yahoo's chart endpoint (in place). Every open
+    position's pos["unpricedSince"] is set while it has no price and cleared when it has one. -> [tickers priced]."""
+    today = now_utc.strftime("%Y-%m-%d")
+    want = []
+    for p in trades_list(state):
+        t = str(p.get("ticker") or "").upper()
+        if p.get("status") == "open" and t and t not in universe and t not in want and not t.startswith("FX:"):
+            want.append(t)
+    got, miss = [], []
+    for t in want[:ORPHAN_MAX]:
+        try:
+            row, why = orphan_row(t, (fetch or _yahoo_chart)(t), now_utc)
+        except Exception as e:                                  # noqa: BLE001 - one symbol never stops the pass
+            row, why = None, f"{type(e).__name__}"
+        if row:
+            universe[t] = row
+            got.append(t)
+        else:
+            miss.append(f"{t} ({why})")
+    if want:
+        log(f"  open positions no book priced: {len(want)} - from Yahoo direct (price-only: stops / targets / trims): "
+            + (", ".join(f"{t} ${universe[t]['price']:,.2f} @ "
+                         + (universe[t]["asOf"][11:16] if universe[t]["asOf"][:10] == today else f"{universe[t]['asOf'][:10]} {universe[t]['asOf'][11:16]}")
+                         + "Z" for t in got) or "none")
+            + (f" · still unpriced: {', '.join(miss)}" if miss else "")
+            + (f" · {len(want) - ORPHAN_MAX} more over the {ORPHAN_MAX}-symbol cap" if len(want) > ORPHAN_MAX else ""))
+    for p in trades_list(state):
+        if p.get("status") != "open":
+            continue
+        t = str(p.get("ticker") or "").upper()
+        if t in universe:
+            if p.get("unpricedSince"):
+                log(f"  {t}: priced again ({universe[t].get('priceSource') or universe[t].get('repo')}) - unpriced since {p['unpricedSince']}")
+                p.pop("unpricedSince", None)
+        elif not p.get("unpricedSince"):
+            p["unpricedSince"] = today
+    return got
 
 
 def load_grades():
@@ -1953,7 +2100,10 @@ def load_trends():
             f"{c.get('runThrough')}" + (f" ({age} day(s) old)" if age else "")
             + (" - STALE: context only" if stale else f" · new equity longs x{m:.2f}" if m != 1.0 else " · no size change")
             + (f" · positioning: {fc.get('label') or 'no signal'}"
-               + (" - shorts being covered: no new short where 10%+ of the float is short" if covering_now() else "") if fc else ""))
+               + (f" - shorts being covered: no new short where {rb.SQUEEZE_SHORT_SO:.0%}+ of the shares are short or "
+                  f"{rb.SQUEEZE_SHORT_DTC:.0f}+ days to cover (FINRA)" if covering_now() else "")
+               + (f" · FINRA settled {fc['reported']['settle']}: the 50 most-shorted {fc['reported']['basketChg']:+.1f}% dollars short"
+                  if (fc.get("reported") or {}).get("basketChg") is not None else "") if fc else ""))
     else:
         log("today's trends: no read yet (TRAPP2-ANALYTICS data/trends/latest.json) - trades run without it")
     return _TREND
@@ -2101,8 +2251,12 @@ def flows_card():
     fl = (doc or {}).get("flows") or {}
     if not fl or fl.get("date") != (doc or {}).get("date"):
         return None
+    rp = fl.get("reported") or {}
     return {"label": fl.get("label"), "z": fl.get("z"), "flags": sorted((fl.get("flags") or {}).keys()),
-            "after": (fl.get("after") or {}).get("prior"), "provisional": bool(fl.get("provisional")), "source": fl.get("source")}
+            "after": (fl.get("after") or {}).get("prior"), "provisional": bool(fl.get("provisional")), "source": fl.get("source"),
+            # z207: FINRA's latest settlement beside the price signature - what shorts DID, about two weeks behind
+            "reported": {"settle": rp.get("settle"), "basketChg": (rp.get("basket") or {}).get("chg"),
+                         "universeChg": (rp.get("universe") or {}).get("chg"), "partial": bool(rp.get("partial"))} if rp.get("settle") else None}
 
 
 def covering_now():
@@ -3531,7 +3685,8 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
         signed_now = None
         htype = pos.get("horizonType") or "swing"
         is_alt = alt_research.asset_class(pos.get("ticker"), u) is not None
-        if ctx is not None:
+        price_only = bool(u.get("priceOnly"))                 # z207: Yahoo direct - no book row to re-score from
+        if ctx is not None and not price_only:
             sc = score_symbol(pos["ticker"], u, ctx)
             if sc:
                 signed_now = sc["signed"]
@@ -3724,7 +3879,7 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
                         exit_reason = "horizon"
                     ed = None
                 hd = pos.get("horizonDays") or SWING_HORIZON
-                signal_gone = (aligned_now is None) or (aligned_now < MIN_SCORE)
+                signal_gone = (aligned_now is None and not price_only) or (aligned_now is not None and aligned_now < MIN_SCORE)
                 if ed and hd and signal_gone:
                     try:
                         age = (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(ed[:10], "%Y-%m-%d")).days
@@ -3773,6 +3928,9 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
             decision, why = "trim", f"tier {pos.get('trimTier')} at {ret * 100:+.1f}% - riding the rest"
         elif in_hold:
             decision, why = "hold", f"minimum hold ({days_held}/{min_hold} sessions) - only a −{hold_disaster:.0%} move closes it"
+        elif price_only:
+            decision, why = "hold", (f"priced from Yahoo direct (no book row this pass) - stops / targets / trims only, "
+                                     f"not re-scored; quote {str(u.get('asOf') or '')[11:16]}Z" + (f" · {etp_note}" if etp_note else ""))
         elif etp:
             decision, why = "hold", (f"{etp_note}: held while its signal is >= {ETP_HOLD_SCORE:.2f} in its direction"
                                      + (f" (now {aligned_now:+.2f})" if aligned_now is not None else " (not re-scored this pass)"))
@@ -3780,6 +3938,10 @@ def manage_open_positions(state, universe, today, ctx=None, review_only=False):
             decision, why = "hold", f"signal faded to {aligned_now:+.2f} - exits at the stop / target or the {pos.get('horizonDaysPlanned') or pos.get('horizonDays') or '—'}-session horizon"
         else:
             decision, why = "hold", ("thesis intact" + (f" (aligned {aligned_now:+.2f} in its direction)" if aligned_now is not None else ""))
+        if direction == -1 and (pos.get("instrument") or "shares") == "shares":
+            crowd, _cw = rb.crowded_short(u, covering=covering_now())
+            if crowd:                                        # z207: held into a crowded short - said every pass
+                why += " · " + _cw.replace(" - a crowded short", "") + " - a crowded short held"
         crn = credit_of(pos.get("ticker"))
         if crn and crn.get("r") and crn.get("r") != "NR":
             ent = pos.get("creditAtEntry") or pos.get("creditBaseline") or {}
@@ -4801,6 +4963,10 @@ def main():
     if not universe:
         log("✗ no universe data — aborting (won't write empty state)")
         sys.exit(1)
+    try:                                       # z207: held names no book priced (the macro book out) - Yahoo direct
+        price_orphans(universe, state, now_utc)
+    except Exception as e:
+        log(f"  orphan pricing unavailable ({type(e).__name__}: {e})")
     fresh = fresh_universe(universe, now_utc) if in_session else {}
     if in_session:
         log(f"quotes: {len(fresh)}/{len(universe)} fresh (≤ {MAX_QUOTE_AGE_MIN:.0f} min old) - only these can trade this pass")
