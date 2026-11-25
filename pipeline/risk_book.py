@@ -32,6 +32,11 @@
 #  short already (borrow cost, recalls, squeeze risk), and SQUEEZE_SHORT_SI (10 %) while the tape shows shorts being
 #  covered (TRAPP2-ANALYTICS' flows: a short-covering rally today, or the session after one). The name gets a put
 #  instead, when it has an option chain.
+#  z207: crowded_short(u, covering) - FINRA's official short interest first (the runner's u["shortPctSO"]: shares short
+#  at the latest settlement / the share count the runner trusts, and u["daysToCover"]): MAX_SHORT_SO (15 %) of the
+#  shares outstanding, or MAX_SHORT_DTC (10) days to cover with DTC_MIN_SO (5 %)+ short; SQUEEZE_SHORT_SO (8 %) /
+#  SQUEEZE_SHORT_DTC (7) while shorts are being covered. Yahoo's short % of float (20 % / 10 %) only where FINRA has no
+#  reading - it disagreed with FINRA's own numbers by 3-300x on 11-25 (WHR 0.1 % vs 32 %, CHTR 45 % vs 9 %).
 # ============================================================
 import math
 import os
@@ -69,6 +74,11 @@ MIN_DV = _envf("RUNNER_RISK_MIN_DV", 250e3)                        # ... no new 
 MIN_SHORT_DV = _envf("RUNNER_RISK_MIN_SHORT_DV", 10e6)             # ... no short sale under $10M a day
 MAX_SHORT_SI = _envf("RUNNER_RISK_MAX_SHORT_SI", 20.0) / 100       # z206: no short sale where 20 %+ of the float is short
 SQUEEZE_SHORT_SI = _envf("RUNNER_RISK_SQUEEZE_SHORT_SI", 10.0) / 100   # ... 10 %+ while shorts are being covered
+MAX_SHORT_SO = _envf("RUNNER_RISK_MAX_SHORT_SO", 15.0) / 100       # z207: FINRA - 15 %+ of the shares outstanding short
+MAX_SHORT_DTC = _envf("RUNNER_RISK_MAX_SHORT_DTC", 10.0)           # ... or 10+ days to cover (with DTC_MIN_SO+ short)
+SQUEEZE_SHORT_SO = _envf("RUNNER_RISK_SQUEEZE_SHORT_SO", 8.0) / 100    # ... 8 %+ while shorts are being covered
+SQUEEZE_SHORT_DTC = _envf("RUNNER_RISK_SQUEEZE_SHORT_DTC", 7.0)        # ... or 7+ days to cover
+DTC_MIN_SO = _envf("RUNNER_RISK_DTC_MIN_SO", 5.0) / 100            # days to cover counts only with 5 %+ of the shares short
 # z190: a fund is recognised by ANY sign of one. TRAPP2-1 (the macro book) lists only funds / ETPs among its US symbols
 # (plus foreign listings, FX, crypto, futures, indices); on 11-16 a throttled Yahoo answer blanked their profiles (no
 # name, isetf "false", no market cap) and the runner shorted GLD, SOXL (3x), TAN and WGMI as if they were stocks.
@@ -409,7 +419,8 @@ def shortable(u, covering=False):
     KNOW is >= $2B (in USD - z190: an unknown cap no longer passes). Paper trading has no borrow desk; this keeps the
     shorts realistic. A name that fails gets a put instead, when it has an option chain. z205: and, when its average
     dollar volume is known, >= MIN_SHORT_DV a day. z206: and not a crowded short - short interest (Yahoo's short % of
-    float) under MAX_SHORT_SI, under SQUEEZE_SHORT_SI while the tape shows shorts being covered (covering=True)."""
+    float) under MAX_SHORT_SI, under SQUEEZE_SHORT_SI while the tape shows shorts being covered (covering=True).
+    z207: FINRA's official reading first - crowded_short()."""
     why = fund_reason(u)
     if why:
         return False, f"{why} - no single-name short"
@@ -424,12 +435,37 @@ def shortable(u, covering=False):
     dv = u.get("dv20USD")
     if dv is not None and dv < MIN_SHORT_DV:
         return False, f"${dv / 1e6:.1f}M traded a day < ${MIN_SHORT_DV / 1e6:.0f}M (borrow, a clean cover)"
+    crowded, why = crowded_short(u, covering)
+    if crowded:
+        return False, why
+    return True, ""
+
+
+def crowded_short(u, covering=False):
+    """(crowded?, why). z207: FINRA's reading first - shares short / shares outstanding (u["shortPctSO"]) and days to
+    cover (u["daysToCover"]); Yahoo's short % of float only where FINRA has no share of shares to give."""
+    when = " while shorts are being covered" if covering else ""
+    so, dtc = u.get("shortPctSO"), u.get("daysToCover")
+    dbar = SQUEEZE_SHORT_DTC if covering else MAX_SHORT_DTC
+    if so is not None and 0 <= so <= 1.0:
+        bar = SQUEEZE_SHORT_SO if covering else MAX_SHORT_SO
+        st = f"FINRA, settled {u['shortSettle']}" if u.get("shortSettle") else "FINRA"
+        if so >= bar:
+            return True, f"{so:.0%} of the shares outstanding sold short ({st}; >= {bar:.0%}{when}) - a crowded short"
+        if dtc is not None and dtc >= dbar and so >= DTC_MIN_SO:
+            return True, (f"{dtc:.1f} days to cover with {so:.0%} of the shares short ({st}; >= {dbar:.0f} days{when}) "
+                          "- a crowded short")
+        return False, ""
     si = u.get("shortPctFloat")
     bar = SQUEEZE_SHORT_SI if covering else MAX_SHORT_SI
-    if si is not None and 0 < si <= 1.0 and si >= bar:
-        return False, (f"{si:.0%} of the float already sold short (>= {bar:.0%}"
-                       + (" while shorts are being covered" if covering else "") + ") - a crowded short")
-    return True, ""
+    if si is not None and 0 < si <= 1.0:
+        if si >= bar:
+            return True, (f"{si:.0%} of the float already sold short (>= {bar:.0%}{when}) - a crowded short "
+                          "(Yahoo's figure; no FINRA share of shares)")
+        if dtc is not None and dtc >= dbar and si >= DTC_MIN_SO:
+            return True, (f"{dtc:.1f} days to cover (FINRA) with {si:.0%} of the float short (Yahoo; >= {dbar:.0f} days{when}) "
+                          "- a crowded short")
+    return False, ""
 
 
 def pos_loss_capped(pos, bankroll):
@@ -447,4 +483,7 @@ def knobs():
             "newRiskPerDay": NEW_RISK_PER_DAY, "posLossCap": POS_LOSS_CAP, "dayHalt": DAY_HALT,
             "drawdownSteps": [list(x) for x in DD_STEPS], "ddWindow": DD_WINDOW,
             "liquidity": {"pctOfDay": LIQ_PCT, "minDollarVolume": MIN_DV, "minShortDollarVolume": MIN_SHORT_DV},
-            "shortCrowding": {"maxShortPctFloat": MAX_SHORT_SI, "whileCovering": SQUEEZE_SHORT_SI}}
+            "shortCrowding": {"maxShortPctFloat": MAX_SHORT_SI, "whileCovering": SQUEEZE_SHORT_SI,
+                              "finra": {"maxShortPctShares": MAX_SHORT_SO, "maxDaysToCover": MAX_SHORT_DTC,
+                                        "whileCovering": {"pctShares": SQUEEZE_SHORT_SO, "daysToCover": SQUEEZE_SHORT_DTC},
+                                        "daysToCoverNeedsPct": DTC_MIN_SO}}}
