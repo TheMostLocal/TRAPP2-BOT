@@ -1446,7 +1446,25 @@
    "dividends": [],
    "currency": "USD",
    "fetchedAt": "2026-11-27T12:35:10+00:00"
+  },
+  "NOW": {
+   "splits": [
+    {
+     "exDate": "2025-12-18",
+     "ratio": 5.0,
+     "label": "5-for-1"
+    }
+   ],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-11-27T15:35:03+00:00"
+  },
+  "SNOW": {
+   "splits": [],
+   "dividends": [],
+   "currency": "USD",
+   "fetchedAt": "2026-11-27T15:35:03+00:00"
   }
  },
- "asOf": "2026-11-27T12:35:10+00:00"
+ "asOf": "2026-11-27T15:35:03+00:00"
 }
